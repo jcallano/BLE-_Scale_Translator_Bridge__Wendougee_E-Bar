@@ -7,7 +7,7 @@
 
 An ultra-low-latency Bluetooth Low Energy (BLE) Man-in-the-Middle (MitM) protocol translator built for the **Waveshare ESP32-S3-Zero** (and compatible ESP32-S3 boards).
 
-The **Timemore Black Mirror Dot** uses a proprietary BLE service (`0x181A` -> `0x2A6D`/`0x2A6E`) that is not natively supported by commercial smart espresso machines (such as **Wendougee Data-S / Lita** or **Decent Espresso**) or popular profiling applications (**Wendougee E-Bar**, **GeeFlow**, **de1app**, **Beanconqueror**). This firmware bridges that gap by simultaneously operating as a **BLE Central (Client)** connected to your Timemore Dot scale and a **BLE Peripheral (Server)** emulating either a **BooKoo Themis Ultra** or an **Acaia Lunar** at **10 Hz**.
+The **Timemore Black Mirror Dot** uses a proprietary BLE service (`0x181A` -> `0x2A6D`/`0x2A6E`) that is not natively supported by commercial smart espresso machines (such as **Wendougee Data-S / Lita** or **Decent Espresso**) or popular profiling applications (**Wendougee E-Bar**, **GeeFlow**, ). This firmware bridges that gap by simultaneously operating as a **BLE Central (Client)** connected to your Timemore Dot scale and a **BLE Peripheral (Server)** emulating either a **BooKoo Themis Ultra** or an **Acaia Lunar** at **10 Hz**.
 
 ---
 
