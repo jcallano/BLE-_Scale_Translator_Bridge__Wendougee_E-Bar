@@ -18,8 +18,6 @@ The **Timemore Black Mirror Dot** uses a proprietary BLE service (`0x181A` -> `0
   - **BLE Peripheral (Output):** Emulates either a **BooKoo Themis Ultra** (`BOOKOO_SC_U XXXXXX`, default) or an **Acaia Lunar** (`ACAIA_L_XXXX`) at **10 Hz (`100 ms` intervals)** with zero queue congestion.
 - **Broad Ecosystem Compatibility:**
   - **Wendougee Espresso Machines (Data-S / Lita):** Full compatibility with the espresso machine's internal BLE controller and both the official **Wendougee E-Bar** app and the community **[GeeFlow](https://github.com/drobekk/GeeFlow)** app (populates Modbus Holding Registers `1415 WEIGHT` and `1423 WEIGHT_RATE` with real-time weight and EMA-smoothed flow rate).
-  - **Decent Espresso (`de1app`):** Works seamlessly in both BooKoo and Acaia modes for gravimetric stop-at-weight and real-time flow graphing.
-  - **Beanconqueror / GaggiMate / Pressensor:** Full support for weight streaming, bidirectional Tare, and Stopwatch commands.
 - **Instant Reconnection After Scale Power-Cycle (Zero Manual Re-Pairing):**
   - Persists the scale's MAC address and BLE address type in non-volatile flash (**NVS**).
   - Handles the Timemore Dot's anonymous wake-up behavior (when powered on normally, the scale advertises with an empty name `""` and requires an active scan hit before `connect()` to avoid NimBLE error `574`).
@@ -27,6 +25,7 @@ The **Timemore Black Mirror Dot** uses a proprietary BLE service (`0x181A` -> `0
   - Background scanning uses a lightweight 25% radio duty cycle (`Interval=60ms, Window=15ms`) and **never** stops BLE advertising while waiting for the scale to turn on, ensuring espresso machines and tablets can discover the bridge at any time.
 - **Bidirectional Command Translation:**
   - Translates incoming **Tare** and **Timer (Start / Stop / Reset)** commands from the espresso machine or app into native Timemore Dot commands (`0x2A6E`), coupled with an instant software tare fallback.
+  - Calculate de Flow Rate of the DOT using  weigh change vs delta time i and EMA  filtering and translated to Emulated BooKoo Data Stream.
 - **Visual RGB Status LED & Single-Button NVS Reset:**
   - Real-time connection feedback via the onboard **WS2812 RGB LED (`GPIO 21`)**.
   - Hold the onboard **`BOOT` button (`GPIO 0`)** for 3 seconds to clear the saved scale MAC from NVS and pair with a new Timemore scale.
