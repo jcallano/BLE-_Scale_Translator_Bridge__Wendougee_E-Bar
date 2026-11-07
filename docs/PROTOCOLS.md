@@ -6,36 +6,53 @@ This document details the low-level Bluetooth Low Energy (BLE) GATT topologies, 
 
 ## 1. Input Protocol: Timemore Black Mirror Dot (BLE Central Role)
 
-The **Timemore Black Mirror Dot** uses an asymmetric dual-characteristic GATT architecture under service `0x181A` (Environmental Sensing):
+The Dot protocol below follows the **native Timemore Dot driver in de1app** ([decentespresso/de1app PR #345](https://github.com/decentespresso/de1app/pull/345)), which was reverse-engineered from HCI snoop logs of the official Timemore app and tested on real hardware. The bridge sends those frames **byte-for-byte**.
 
 | GATT Entity | UUID | Properties | Purpose |
 | :--- | :---: | :---: | :--- |
-| **Primary Service** | `0x181A` (`0000181a-0000-1000-8000-00805f9b34fb`) | Primary | Main scale telemetry and control service |
-| **Telemetry Characteristic (RX)** | `0x2A6D` (`00002a6d-0000-1000-8000-00805f9b34fb`) | `NOTIFY`, `READ` | Streams real-time weight frames from scale to bridge |
-| **CCCD Descriptor** | `0x2902` | `READ`, `WRITE` | Writing `0x01 0x00` enables notifications |
-| **Command Characteristic (TX)** | `0x2A6E` (`00002a6e-0000-1000-8000-00805f9b34fb`) | `WRITE`, `WRITE_NR` | Receives Tare, Timer, and Keep-Alive commands |
+| **Primary Service** | `0xFFF0` | Primary | Timemore Dot scale service |
+| **Telemetry Characteristic (RX)** | `0xFFF1` | `NOTIFY` | Weight frames and command responses (scale → bridge) |
+| **Command Characteristic (TX)** | `0xFFF2` | `WRITE`, `WRITE_NR` | Init, poll, tare and timer commands (bridge → scale) |
+
+Discovery order in `discoverAndSubscribeTimemore()`: `0xFFF0` (Dot) first, then `0xFFE0` (UART variant: `0xFFE1`/`0xFFE2`), then `0x181D` (SIG Weight Scale: `0x2A9D`). Only `0xFFF0` uses the frames below; the other variants keep the legacy generic handling.
 
 ### 1.1. Wake-on-Power & Anonymous Advertising Behavior
-- **Pairing Mode:** When the physical pairing button on the scale is held, the scale advertises its ASCII Local Name (`"Timemore Scale"`, `"Black Mirror"`, or `"TIMEMORE"`).
-- **Normal Power-On (After Reset/Sleep):** The scale advertises **anonymously (`Name = ""`)** using `ADV_IND` (`advType = 0`, connectable) with its static/random MAC address (`e.g., a4:6d:33:91:a3:41`).
-- **Connection Requirement (`err=574` mitigation):** Calling `pScaleClient->connect()` blind without receiving a live advertising packet in the controller's scan cache results in NimBLE error `574` (`BLE_HS_ENOTCONN` / `0x3E` Connection Failed to be Established). Therefore, the bridge runs a non-blocking background scan (`25%` duty cycle) and initiates `connect()` immediately after capturing a fresh advertisement from the saved MAC address.
+- **Pairing Mode:** the scale answers `SCAN_REQ` with its name (`"TIMEMORE..."`) and accepts connections from any central.
+- **Normal Power-On:** the scale (Phyplus `PHY6222` SoC, MAC prefix `a4:6d:33`) advertises **anonymously** (`ADV_IND`, connectable, ~1 s period) and only accepts centrals that completed SMP bonding once in pairing mode (White List). Otherwise `connect()` fails with NimBLE error `574` (`0x3E`).
+- **Mitigation:** the bridge bonds (Just-Works, `secureConnection()` after GATT discovery), persists the MAC in NVS, and only calls `connect()` right after capturing a fresh connectable advertisement.
 
-### 1.2. Weight Notification Frame (`0x2A6D`, 9 Bytes)
-Weight is encoded in **32-bit Little-Endian** milligrams starting at byte offset `1`:
+### 1.2. Weight Notification Frame (`0xFFF1`)
 
-| Byte Offset | Hex Example | Field | Description |
-| :---: | :---: | :--- | :--- |
-| **`[0]`** | `0x00` | Stability / Flags | `0x00` = Stable reading; non-zero = Unstable / in-motion |
-| **`[1..4]`** | `E4 2A 00 00` | Signed Weight (`int32_t` LE) | Weight in **milligrams (mg)**. Divide by `1000.0f` for grams (`0x00002AE4` = `10,980 mg` = `10.98 g` -> `11.0 g`) |
-| **`[5..8]`** | `00 00 00 00` | Tare / Auxiliary Data | Auxiliary state bytes |
+```text
+[0]  [1]  [2]   [3]   [4] [5] [6] [7] [8] [9] ...
+A5   5A   Type  Stat  ..  ..  ..  ..  WH  WL  ...
+```
 
-### 1.3. Outgoing Control Commands (`0x2A6E`)
-- **Tare (`0x00`):** Single byte `{ 0x00 }` written to `0x2A6E` resets the scale display to zero.
-- **Keep-Alive (`0x20 0x00`):** Sent every `25,000 ms` (`{ 0x20, 0x00 }`) using Write Without Response to prevent the scale's auto-sleep timer from powering off the unit during a session.
-- **Timer Controls:**
-  - Start Timer: `{ 0x08 }`
-  - Stop / Pause Timer: `{ 0x09 }`
-  - Reset Timer: `{ 0x0A }`
+| Byte(s) | Field | Description |
+| :---: | :--- | :--- |
+| `[0..1]` | Header | Always `A5 5A` |
+| `[2]` | Type | `0x01` = weight data; `0x02` = command response; `0x03` = ACK (no weight) |
+| `[8..9]` | Weight | **Signed 16-bit big-endian**, in **0.1 g** units → `grams = int16(WH, WL) / 10.0` |
+
+Frames shorter than 10 bytes or with a type other than `0x01` are ignored for weight. The scale streams at **10 Hz**. On every scale connection the bridge logs the first 3 raw frames with the decoded weight (`[TIMEMORE-RX] ...`) so the decoding can be checked against the display.
+
+> **Note:** the response to the battery query (`A5 5A 02 05 ...`) does **not** carry a battery percentage (a full Dot reports `3`), so it is ignored.
+
+### 1.3. Outgoing Commands (`0xFFF2`)
+
+All frames are sent **verbatim** (they are not rebuilt with a CRC, since their length/trailer does not match a simple `len + CRC-16` layout).
+
+| Action | Frame (hex) | When |
+| :--- | :--- | :--- |
+| **Init sequence** (official app) | `A55A021300000000`, `A55A020800000000`, `A55A020500000000`, `A55A020200000000`, `A55A020600000000`, `A55A020C00000000` | After connect: sent twice, 150 ms apart, 300 ms between passes |
+| **Poll** (keep-alive) | `A55A020800000000`, then 100 ms later `A55A030800020100000025` | After init, then every **10 s** |
+| **Tare** | Poll, then `A55A030D000200000071` | On tare request (after the instant software tare) |
+| **Timer Start** | `A55A03020001010020` | Timer start from the app |
+| **Timer Stop** | `A55A030200010200FFD0` | Timer stop from the app |
+| **Timer Reset** | `A55A030200010300FF81` | Timer reset from the app |
+
+### 1.4. Hybrid Tare
+When a tare is requested, `bridge_tx` immediately sets `softwareTareOffset = rawWeight`, so the app sees `0.0 g` on the very next packet. The physical tare frame is then sent by `scale_link`. When the scale's own reading returns to ~0 g, the software offset is cleared automatically.
 
 ---
 
@@ -65,7 +82,7 @@ Reverse engineering of the official **Wendougee E-Bar** Android app and **[`drob
 | `7..26` | **20 B** | `0x09` | `13 09 42 4F 4F 4B 4F 4F 5F 53 43 5F 55 20 XX XX XX XX XX XX` | **Complete Local Name:** `"BOOKOO_SC_U XXXXXX"` (18 ASCII chars) |
 
 ### 2.3. 20-Byte Weight & Flow Telemetry Frame (`0x0FFE -> 0xFF11`)
-Transmitted at **10 Hz** (`100 ms` intervals) per [`BooKooCode/OpenSource/bookoo_ultra_scale/protocols.md`](https://github.com/BooKooCode/OpenSource/blob/main/bookoo_ultra_scale/protocols.md):
+Transmitted once per scale sample (the Dot streams at 10 Hz), with a 100 ms filler if the scale is silent, per [`BooKooCode/OpenSource/bookoo_ultra_scale/protocols.md`](https://github.com/BooKooCode/OpenSource/blob/main/bookoo_ultra_scale/protocols.md):
 
 | Byte | Value / Encoding | Description |
 | :---: | :---: | :--- |

@@ -4,7 +4,8 @@
 Este firmware convierte una placa **Waveshare ESP32-S3-Zero** en un puente Bluetooth Low Energy (BLE) transparente (**Man-in-the-Middle / MitM**) que opera simultáneamente en modo **Cliente BLE** y **Servidor BLE** utilizando la pila `NimBLE-Arduino`:
 
 1. **Entrada (Rol Cliente BLE):** Se conecta automáticamente a una balanza **Timemore Black Mirror Dot** (compatible también con Timemore Basic / Plus / Nano), recibe las notificaciones de peso en tiempo real, mantiene activa la báscula para evitar su apagado automático y permite enviarle comandos de **Tara** y **Cronómetro**.
-2. **Salida (Rol Servidor BLE):** Emula de forma estricta una balanza **Acaia Lunar** (`LUNAR-XXXX`), exponiendo los servicios primarios `0xFF08` y `0x1820` para ser detectada nativamente por máquinas y aplicaciones de espresso como **Wendougee, Profitec Move 2.0, Decent Espresso, Smart Espresso Profiler y Beanconqueror**.
+2. **Salida (Rol Servidor BLE):** Emula una balanza **BooKoo Themis Ultra** (`BOOKOO_SC_U XXXXXX`, modo por defecto con `#define EMULATE_BOOKOO`) o una **Acaia Lunar** (`ACAIA_L_XXXX`, servicios `0xFF08` / `0x1820` / ISSC), para ser detectada nativamente por máquinas y aplicaciones de espresso como **Wendougee (E-Bar / GeeFlow), Decent Espresso (de1app / Decaid), Smart Espresso Profiler y Beanconqueror**.
+3. **Baja latencia:** cada muestra de la balanza (10 Hz) se reenvía en cuanto llega, mediante una arquitectura que usa explícitamente los dos núcleos del ESP32-S3 (ver la [sección 7](#7-arquitectura-multinúcleo-y-baja-latencia)). Latencia interna medida: **~0.33 ms de media, < 0.7 ms en el peor caso**.
 
 ---
 
@@ -51,18 +52,21 @@ flowchart TD
     C -- Sí --> D["Borrar MAC en NVS\n(6 destellos Magenta)"]
     C -- No --> E["Leer MAC guardada en NVS (Preferences.h)"]
     D --> E
-    E --> F["Inicializar NimBLE Dual (LUNAR-XXXX)"]
-    F --> G["Iniciar Servidor Acaia Lunar\nAdvertising 16-bit: 0xFF08 y 0x1820\n(Siempre Visible)"]
-    G --> H{"¿Existe MAC\nguardada en NVS?"}
-    H -- Sí --> I["Escanear y conectar solo\na la MAC guardada"]
-    H -- No --> J["Auto-Discovery (4s):\nFiltrar por UUID 0xFFE0/0xFFF0 o nombre\nTIMEMORE / DOT / MACARON / BLACK MIRROR\ny elegir mejor RSSI"]
-    I --> K["Conectar y suscribir Notificaciones\n(0xFFE1 / 0xFFF1 / 0x2A9D)"]
+    E --> F["Inicializar NimBLE Dual\n(BOOKOO_SC_U XXXXXX o ACAIA_L_XXXX)"]
+    F --> T1["Crear tarea bridge_tx (core 0)"]
+    T1 --> G["Iniciar Servidor BooKoo / Acaia\n(Advertising siempre visible)"]
+    G --> T2["Crear tarea scale_link (core 1)"]
+    T2 --> H{"¿Existe MAC\nguardada en NVS?"}
+    H -- Sí --> I["Conexión directa rápida\na la MAC guardada"]
+    H -- No --> J["Auto-Discovery:\nFiltrar por UUID 0xFFF0/0xFFE0/0x181D o nombre\nTIMEMORE / DOT / MACARON / BLACK MIRROR"]
+    I --> K["Conectar y suscribir Notificaciones\n(0xFFF1 / 0xFFE1 / 0x2A9D)"]
     J --> K
-    K --> L["Guardar MAC en NVS (si es nueva)"]
-    L --> M["Bucle Principal No Bloqueante (loop)"]
-    M --> N["Recibir Peso Timemore -> Decodificar -> Enviar Trama Acaia 10 Hz"]
-    M --> O["Cada 25s: Enviar Pulso Keep-Alive Anti Auto-Off a Timemore"]
-    M --> P["Procesar Handshake Acaia (IDENTIFY, HEARTBEAT, TARE, TIMER)"]
+    K --> L["Guardar MAC en NVS +\nsecuencia de inicio de la Dot"]
+    L --> M["Funcionamiento por tareas"]
+    M --> N["bridge_tx (core 0): muestra nueva ->\ncaudal -> trama BooKoo/Acaia al instante"]
+    M --> O["scale_link (core 1): sondeo cada 10 s,\ntara/timer físicos, reconexión"]
+    M --> P["bridge_tx: Handshake Acaia/BooKoo\n(IDENTIFY, HEARTBEAT, TARE, TIMER)"]
+    M --> Q["loop (core 1): LED, botón BOOT,\nSerial y estadísticas"]
 ```
 
 ---
@@ -98,92 +102,44 @@ Dependiendo de la revisión de hardware/firmware de la familia **Timemore Black 
 
 ---
 
-#### C. Anatomía de la Trama Binaria Timemore Open Scale (`0xA5, 0x5A`) y CRC-16/IBM
+#### C. Protocolo de la Timemore Dot (servicio `0xFFF0`)
 
-El protocolo nativo de la **Timemore Dot** sobre el servicio `0xFFF0` (`0xFFF1` / `0xFFF2`) utiliza tramas binarias encabezadas por los bytes mágicos **`0xA5, 0x5A`** y protegidas al final por un **CRC-16/IBM (MODBUS/ARC)** de 2 bytes:
+El protocolo implementado sigue el **driver nativo de la Timemore Dot en de1app** ([decentespresso/de1app PR #345](https://github.com/decentespresso/de1app/pull/345)). Ese driver se obtuvo de capturas HCI de la app oficial de Timemore y está probado con hardware real. El puente envía esas tramas **byte a byte, sin recalcularlas**: su longitud y su cola no encajan con un formato simple `longitud + CRC-16`, así que no se reconstruyen con `calculateTimemoreCRC16()`.
 
-```text
-+--------+--------+--------+--------+--------+--------+--------------------+---------+---------+
-| Byte 0 | Byte 1 | Byte 2 | Byte 3 | Byte 4 | Byte 5 | Bytes 6 .. (6+N-1) |  End-1  |   End   |
-+--------+--------+--------+--------+--------+--------+--------------------+---------+---------+
-|  0xA5  |  0x5A  | Opcode |  Cmd   | Len_H  | Len_L  |   Payload (N B)    | CRC16_H | CRC16_L |
-+--------+--------+--------+--------+--------+--------+--------------------+---------+---------+
-```
-
-1. **Cabecera Mágica (`Bytes 0 y 1`):** Siempre fija en `0xA5, 0x5A`.
-2. **Código de Operación (`Byte 2 - Opcode`):**
-   - `0x01`: Notificación asíncrona o respuesta desde la balanza hacia el cliente (`Balanza → ESP32-S3`).
-   - `0x02`: Consulta de lectura (`Read Request`) desde el cliente hacia la balanza (`ESP32-S3 → Balanza`).
-   - `0x03`: Comando de acción/escritura (`Action Command`, como Tara o Timer) desde el cliente (`ESP32-S3 → Balanza`).
-3. **Comando / Tópico (`Byte 3 - Cmd`):**
-   - `0x01`: **Peso en tiempo real** y estabilidad.
-   - `0x02`: **Estado del Cronómetro (Timer)**.
-   - `0x05`: **Nivel de Batería** (`0–100%`).
-   - `0x09`: **Iniciar Cronómetro (`Timer Start`)**.
-   - `0x0A`: **Pausar/Detener Cronómetro (`Timer Stop`)**.
-   - `0x0B`: **Reiniciar Cronómetro (`Timer Reset`)**.
-   - `0x0D` (o `0x01` con `Opcode 0x03`): **Ejecutar Tara (`Tare` / Puesta a cero)**.
-4. **Longitud del Payload (`Bytes 4 y 5 - Len_H, Len_L`):**
-   - Entero de 16 bits sin signo en **Big-Endian** (`N = (Byte[4] << 8) | Byte[5]`) que indica cuántos bytes de datos vienen antes del CRC-16.
-5. **Cálculo del Checksum `CRC-16/IBM` (`Bytes End-1 y End`):**
-   - Se calcula sobre todos los bytes desde `Byte 0 (0xA5)` hasta el último byte del `Payload` (`6 + N` bytes) usando el polinomio reflejado **`0xA001`** (polinomio normal `0x8005`) y valor inicial **`0xFFFF`**:
-     ```cpp
-     uint16_t crc = 0xFFFF;
-     for (size_t i = 0; i < length; i++) {
-       crc ^= data[i];
-       for (uint8_t bit = 0; bit < 8; bit++) {
-         crc = (crc & 0x0001) ? ((crc >> 1) ^ 0xA001) : (crc >> 1);
-       }
-     }
-     // CRC16_H = (crc >> 8) & 0xFF;  CRC16_L = crc & 0xFF;
-     ```
+> [!NOTE]
+> Versiones anteriores de esta documentación describían un formato con CRC-16/IBM y comandos `0x09`/`0x0A`/`0x0B` para el timer. Ese formato no coincide con el de la Dot real, así que se reemplazó.
 
 ---
 
 #### D. Detalle Byte por Byte de las Tramas de la Timemore Dot
 
-1. **Notificación de Peso en Formato Open Scale (`0xA5, 0x5A`, `Cmd = 0x01`):**
-   - **Variante de 32 bits (`Len >= 5` bytes de payload):**
-     ```text
-     [0]  [1]  [2]  [3]  [4]  [5]  [6]   [7]  [8]  [9]  [10]    [11]    [12]
-     0xA5 0x5A 0x01 0x01 0x00 0x05 Stable W3   W2   W1   W0    CRC16_H CRC16_L
-     ```
-     - `Byte 6 (Stable)`: `0x01` = lectura estable; `0x00` = lectura en movimiento.
-     - `Bytes 7..10 (W3..W0)`: Entero de 32 bits con signo (`int32_t`) en **Big-Endian** expresado en décimas de gramo (`0.1 g`).
-     - Conversión: $\text{Peso (g)} = \frac{\text{int32\_be}(W_3, W_2, W_1, W_0)}{10.0}$.
-   - **Variante compacta de 16 bits (`Len == 2..4` bytes de payload):**
-     ```text
-     [0]  [1]  [2]  [3]  [4]  [5]  [6]  [7]  [8]     [9]     [10]
-     0xA5 0x5A 0x01 0x01 0x00 0x03  W1   W0  Stable CRC16_H CRC16_L
-     ```
-     - `Bytes 6..7 (W1, W0)`: Entero de 16 bits con signo (`int16_t`) en **Big-Endian** en décimas de gramo (`0.1 g`).
-
-2. **Notificación de Peso en Formato UART Transparente (`0xAA` o `0x55` en `0xFFE1`):**
-   Algunas unidades Timemore transmiten tramas compactas de 6 a 14 bytes con cabecera `0xAA` o `0x55`:
+1. **Notificación de peso (`0xFFF1`):**
    ```text
-   [0]    [1]      [2]      [3]      [4]      [5]
-   0xAA  Status  Weight_H Weight_L Battery  Checksum
+   [0]  [1]  [2]   [3]   [4] [5] [6] [7] [8] [9] ...
+   A5   5A   Tipo  Est.  ..  ..  ..  ..  WH  WL  ...
    ```
-   - `Byte 0`: Cabecera `0xAA` (o `0x55`).
-   - `Byte 1 (Status)`:
-     - `Bit 0 (0x01)`: `1` = Estable, `0` = Inestable.
-     - `Bit 1 (0x02)` o `Bit 7 (0x80)` (o valor `0x2D` = `'-'`): Signo negativo (`-`).
-   - `Bytes 2..3 (Weight_H, Weight_L)`: Magnitud de 16 bits sin signo en **Big-Endian** (`(Byte[2] << 8) | Byte[3]`) en décimas de gramo (`0.1 g`).
-   - `Byte 4 (Battery)`: Porcentaje de batería (`1–100%`) si está presente.
+   - `Bytes 0..1`: cabecera fija `A5 5A`.
+   - `Byte 2 (Tipo)`: `0x01` = peso; `0x02` = respuesta a comando; `0x03` = ACK (sin peso).
+   - `Bytes 8..9 (WH, WL)`: entero de 16 bits **con signo**, **big-endian**, en décimas de gramo: $\text{Peso (g)} = \frac{\text{int16\_be}(W_H, W_L)}{10.0}$.
+   - Las tramas de menos de 10 bytes o de tipo distinto de `0x01` se ignoran para el peso. La balanza envía a **10 Hz**.
+   - **Verificación:** en cada conexión, el Monitor Serie muestra las 3 primeras tramas crudas con su peso interpretado (`[TIMEMORE-RX] Trama de peso 1/3: A5 5A 01 ... -> 12.3 g`), para compararlas con la pantalla de la Dot.
+   - La respuesta a la consulta de batería (`A5 5A 02 05 ...`) **no** es un porcentaje (con batería llena reporta `3`), por lo que se ignora.
 
-3. **Comandos Enviados por el ESP32-S3 a la Timemore Dot (Tara, Timer y Keep-Alive):**
+2. **Variante UART (`0xFFE0`: `0xFFE1` / `0xFFE2`, otros modelos):** se mantiene el manejo genérico anterior (tramas con cabecera `0xAA`/`0x55`, tara `AA 02 43 00 45`). Solo se usa si la balanza no expone `0xFFF0`.
 
-   | Acción | Trama Hexadecimal (`0xFFF2` Open Scale) | Trama Alternativa (`0xFFE1/0xFFE2` UART) |
+3. **Comandos enviados por el ESP32-S3 a la Timemore Dot (`0xFFF2`):**
+
+   | Acción | Trama hexadecimal (exacta, de de1app) | Cuándo se envía |
    | :--- | :--- | :--- |
-   | **Tara (Puesta a cero)** | `A5 5A 03 0D 00 00 [CRC_H] [CRC_L]` y `A5 5A 03 01 00 00 [CRC_H] [CRC_L]` | `AA 02 43 00 45` y `0x00` (1 byte) |
-   | **Timer Start (Iniciar)** | `A5 5A 03 09 00 00 [CRC_H] [CRC_L]` | `AA 02 33 01 36` |
-   | **Timer Stop (Pausar)** | `A5 5A 03 0A 00 00 [CRC_H] [CRC_L]` | `AA 02 33 00 35` |
-   | **Timer Reset (Reiniciar)** | `A5 5A 03 0B 00 00 [CRC_H] [CRC_L]` | `AA 02 33 02 37` |
-   | **Keep-Alive Batería (cada 25s)** | `A5 5A 02 05 00 00 [CRC_H] [CRC_L]` | Lectura GATT en `pScaleNotifyChar->readValue()` |
-   | **Keep-Alive Timer (cada 25s)** | `A5 5A 02 02 00 00 [CRC_H] [CRC_L]` | — |
+   | **Secuencia de inicio** (app oficial) | `A55A021300000000`, `A55A020800000000`, `A55A020500000000`, `A55A020200000000`, `A55A020600000000`, `A55A020C00000000` | Al conectar: dos pasadas, 150 ms entre comandos y 300 ms entre pasadas (~2.5 s) |
+   | **Sondeo / keep-alive** | `A55A020800000000` y, 100 ms después, `A55A030800020100000025` | Tras la secuencia de inicio y luego **cada 10 s** |
+   | **Tara** | Sondeo y luego `A55A030D000200000071` | Al pedir tara (después de la tara por software) |
+   | **Timer Start** | `A55A03020001010020` | Orden de iniciar el timer desde la App |
+   | **Timer Stop** | `A55A030200010200FFD0` | Orden de detener el timer |
+   | **Timer Reset** | `A55A030200010300FF81` | Orden de reiniciar el timer |
 
    > [!TIP]
-   > **Tara Híbrida Instantánea:** Cuando la App o el usuario solicita una Tara (`executeTimemoreTare()`), el ESP32-S3 aplica en el mismo milisegundo un `softwareTareOffset = lastRawScaleWeightGrams` (poniendo el peso reportado a `0.0 g` de forma instantánea para la máquina de espresso) y simultáneamente transmite la trama física de Tara a la Timemore Dot. Cuando la balanza física confirma su puesta a cero (`|peso_crudo| < 0.8 g`), el offset por software se limpia automáticamente a `0.0f`.
+   > **Tara híbrida instantánea:** al pedir una tara, `bridge_tx` (core 0) aplica en el acto `softwareTareOffset = rawWeightGrams`, de modo que la App recibe `0.0 g` en el siguiente paquete. La trama física de tara la envía después `scale_link` (core 1). Cuando el peso crudo de la balanza vuelve a ~0 g, el offset por software se borra solo.
 
 ---
 
@@ -410,18 +366,27 @@ Para garantizar compatibilidad simultánea con **Wendougee E-Bar / GeeFlow** y *
 
 Conectando la placa por USB-C y abriendo el **Monitor Serie** a `115200 baudios`:
 
-1. **Secuencia de Arranque Protegida (5 segundos):**
-   - Al encender, el firmware abre una ventana de 5 segundos imprimiendo una cuenta regresiva y la causa exacta del último reinicio (`POWERON`, `SW`, `PANIC`, `WDT`, `BROWNOUT`, `USB`) antes de iniciar el radio BLE.
-2. **Reporte de Estado Automático (cada 5 segundos):**
+1. **Secuencia de Arranque:**
+   - Al encender, el firmware imprime una breve cuenta regresiva (~1.2 s) con la causa exacta del último reinicio (`POWERON`, `SW`, `PANIC`, `WDT`, `BROWNOUT`, `USB`) antes de iniciar el radio BLE, y al final la línea `[BOOT] Tareas: bridge_tx (core 0, prio 20) | scale_link (core 1, prio 3) | loop (core 1)`.
+2. **Reporte Automático (cada 5 segundos):**
    ```text
-   [   10024 ms] [STATUS] Dot=CONECTADA (c8:47:8c:xx:xx:xx) | AppAcaia=CONECTADA (LUNAR-4A9C) | Peso= +18.4g | Bat=90% | Rx=142 Tx=198 | Heap=254120 B
+   [  130028 ms] [STATUS] Dot=CONECTADA (a4:6d:33:91:a3:41) | AppAcaia=CONECTADA (BOOKOO_SC_U CE5710) | Peso=  -1.1g | Bat=90% | Rx=1039 Tx=675 | Heap=226964 B
+   [  130029 ms] [LINK] Dot: itvl=20.00ms lat=0 phy=2/2M | App: itvl=60.00ms lat=0 phy=2/2M mtu=256
+   [  130029 ms] [LAT] n=49 (9.8 Hz) pisadas=0 | dt balanza ms min/avg/max=100/102/200 | despertar us=34/42/100 | e2e us=291/337/626
+   [  130029 ms] [LAT] e2e hist <0.25ms:0 <1ms:49 <5ms:0 <15ms:0 >=15ms:0 | txPeso=50 txFallos=0
    ```
+   - **`[LINK]`**: intervalo de conexión, latencia de esclavo, PHY y MTU que **realmente** aceptó cada extremo.
+   - **`[LAT]`**: frecuencia real de la balanza (`dt balanza`), muestras pisadas antes de procesarse (`pisadas`), tiempo en despertar `bridge_tx` y **e2e** = llegada de la muestra al ESP32 → notificación entregada al stack BLE (no incluye el tiempo en el aire), con histograma, paquetes de peso enviados y rechazados.
+   - **`[TIMEMORE-RX]`**: en cada conexión con la balanza, las 3 primeras tramas de peso crudas y el peso interpretado.
+   - **`[ACAIA-SRV] Intervalo App ...`**: resultado de la verificación del intervalo con la App (`OK` o `Re-solicitando ...`).
 3. **Comandos Interactivos desde la PC:**
    Escribe cualquiera de estas letras en el Monitor Serie y presiona `Enter`:
-   - `?` o `i` : Muestra inmediatamente el resumen de estado, MACs, peso, batería y memoria RAM libre.
-   - `t` : Ejecuta un comando de **TARA** inmediatamente.
+   - `?` o `i` : Muestra inmediatamente el resumen de estado.
+   - `l` : Muestra en el acto los parámetros de enlace y las estadísticas de latencia.
+   - `t` : Ejecuta una **TARA** (por software al instante + física en la balanza).
    - `r` : Borra la dirección MAC guardada en **NVS** y reinicia la búsqueda de balanzas cercanas.
    - `s` : Fuerza un nuevo ciclo de escaneo BLE.
+   - `p` : Pausa / reanuda el escaneo de la balanza (deja el radio libre para la App).
 
 ---
 
@@ -432,7 +397,7 @@ Para compilar y cargar el firmware en la **Waveshare ESP32-S3-Zero** sin errores
 | Parámetro en `Herramientas` | Valor Obligatorio |
 | :--- | :--- |
 | **Board (Placa)** | **`Waveshare ESP32-S3-Zero`** *(o **`ESP32S3 Dev Module`** normal — **NUNCA** seleccionar la variante `Octal`)* |
-| **USB CDC On Boot** | **`Enabled`** |
+| **USB CDC On Boot** | **`Enabled`** *(obligatorio: el sketch usa `Serial.setTxTimeoutMs()`, que solo existe en ese modo)* |
 | **USB Mode** | **`Hardware CDC and JTAG`** |
 | **Flash Mode** | **`QIO 80MHz`** *(o `DIO 80MHz`)* |
 | **Flash Size** | **`4MB (32Mb)`** |
@@ -440,4 +405,70 @@ Para compilar y cargar el firmware en la **Waveshare ESP32-S3-Zero** sin errores
 | **PSRAM** | **`Disabled`** *(o `QSPI PSRAM`)* |
 | **CPU Frequency** | **`240MHz (WiFi)`** |
 | **Upload Speed** | **`921600`** |
+
+Probado con **esp32 de Espressif v3.3.12** y **NimBLE-Arduino v2.5.2**. Las funciones de baja latencia (notify dirigido, PHY 2M, verificación de enlace y estadísticas) requieren NimBLE-Arduino **v2.x**.
+
+---
+
+## 7. Arquitectura Multinúcleo y Baja Latencia
+
+### 7.1. Reparto de tareas entre los dos núcleos
+
+Antes, toda la lógica corría en `loop()` (core 1, prioridad 1) con un `delay(3)` fijo, y los dos núcleos solo se usaban por la configuración por defecto de Arduino y NimBLE. Ahora el reparto es explícito:
+
+| Núcleo | Tarea | Prioridad | Responsabilidad |
+| :---: | :--- | :---: | :--- |
+| 0 | Controlador BT + `nimble_host` | 23 / 21 | Pila BLE (todos los callbacks de NimBLE corren aquí). |
+| 0 | **`bridge_tx`** | 20 | **Único emisor hacia la App/máquina.** Se despierta por bits de notificación FreeRTOS en cuanto termina el callback de la balanza, en el mismo núcleo que `nimble_host` (sin salto entre núcleos). Envía peso, respuestas del handshake y timer. |
+| 1 | **`scale_link`** | 3 | Todo lo que puede bloquear: escaneo, `connect()` síncrono (hasta 4 s + reintento), descubrimiento GATT, secuencia de inicio de la Dot, sondeo, tara y timer físicos. Mientras espera, `bridge_tx` sigue atendiendo a la App: el handshake ya no se congela durante una reconexión de la balanza. |
+| 1 | `loop()` | 1 | LED, botón `BOOT`, comandos Serial y estadísticas. |
+
+### 7.2. Pipeline dirigido por eventos
+
+- Los callbacks no envían nada: publican eventos con **bits de notificación FreeRTOS** (`postBridgeEvent()` / `postScaleEvent()`), que son atómicos y no pierden eventos (las antiguas banderas `pending*` sí podían perderlos entre núcleos).
+- **Envío inmediato:** cada muestra nueva se reenvía en cuanto llega. El reenvío cada 100 ms queda solo como **relleno** si la balanza no manda nada. Entre dos pesos hay al menos `WEIGHT_MIN_GAP_MS` (15 ms) para no saturar la cola ATT, y entre dos paquetes cualesquiera al menos `HANDSHAKE_PACING_MS` (2 ms).
+- **Prioridad de envío:** peso nuevo > Heartbeat ACK > INFO > STATUS > ACK de evento > timer inmediato > relleno > timer a 10 Hz.
+- **Caudal (g/s):** se calcula una vez por muestra real, con su marca de tiempo de llegada (dt exacto, sin jitter del planificador), con EMA `FLOW_EMA_ALPHA = 0.35`.
+- **Timer Acaia:** tiene su propio reloj a 10 Hz (antes iba atado al relleno de peso y se congelaba con el envío inmediato).
+- **Notify dirigido:** las notificaciones van al *handle* de la conexión de la App. Sin handle, NimBLE v2 construye un `std::vector` (reserva en heap) en cada paquete.
+
+### 7.3. Ajustes de radio
+
+| Enlace | Rol del ESP32 | Ajuste | Momento |
+| :--- | :--- | :--- | :--- |
+| Balanza | Central (lo impone) | Intervalo **15 ms** fijo (antes 30–50 ms) + **PHY 2M** | 1.5 s después de conectar (tras el cifrado SMP) |
+| App / máquina | Periférico (solo lo pide) | Intervalo **15–30 ms** + **PHY 2M** | Al conectar (intervalo) y a los 3 s (PHY) |
+
+- La petición a la App cumple las reglas de iOS/Android (mínimo ≥ 15 ms y máximo ≥ mínimo + 15 ms). Una petición de 10–20 ms se rechazaba entera y el central se quedaba en 60 ms.
+- `scale_link` verifica el intervalo que realmente aplicó la App y, si sigue por encima de 30 ms, lo vuelve a pedir cada 5 s, hasta 3 veces.
+- PHY 2M reduce a la mitad el tiempo en el aire por paquete. Si un extremo no lo soporta, el enlace sigue en 1M.
+
+### 7.4. Presupuesto de latencia medido
+
+Medido con una tablet Android con de1app como central (antes del ajuste de intervalo compatible con iOS/Android):
+
+| Tramo | Media | Peor caso |
+| :--- | :---: | :---: |
+| Esperar el evento de conexión con la balanza (15–20 ms) | ~8–10 ms | 15–20 ms |
+| Procesamiento dentro del ESP32 | **0.33 ms** | **< 0.7 ms** |
+| Esperar el evento de conexión con la App (60 ms observados) | ~30 ms | 60 ms |
+
+La balanza muestrea a **10 Hz**: el peso llega, de media, con 50 ms de antigüedad por la propia frecuencia de muestreo. El intervalo de la App es el tramo controlable de mayor peso.
+
+### 7.5. Interruptores de ajuste (al inicio del `.ino`)
+
+| Constante | Valor | Para qué sirve |
+| :--- | :---: | :--- |
+| `WEIGHT_MIN_GAP_MS` | 15 | Separación mínima entre pesos. Subir a 25–30 si la App se atasca. |
+| `SCALE_CONN_ITVL_MIN/MAX` | 12 / 12 | Intervalo con la balanza (×1.25 ms). Volver a 24/40 si se desconecta. |
+| `APP_CONN_ITVL_MIN/MAX` | 12 / 24 | Intervalo pedido a la App (×1.25 ms). |
+| `ENABLE_2M_PHY_SCALE` / `_APP` | 1 / 1 | Poner a 0 si algún enlace se vuelve inestable. |
+| `ENABLE_LATENCY_STATS` | 1 | Instrumentación `[LAT]`; 0 la desactiva por completo. |
+
+---
+
+## 8. Compatibilidad con las Apps de Decent Espresso
+
+- **de1app:** tiene **soporte nativo para la Timemore Dot** desde julio de 2026 ([de1app PR #345](https://github.com/decentespresso/de1app/pull/345)). Con de1app actualizado se puede conectar la Dot directamente, sin este puente. Los comandos de la Dot de este firmware son copias exactas de esa implementación.
+- **Decaid (la app nueva de Decent):** no tiene driver de Timemore. Decent rechazó el soporte nativo y pidió a la comunidad un **plugin externo** de báscula ([decaid #737](https://github.com/decentespresso/decaid/issues/737)). Decaid reconoce cualquier dispositivo cuyo nombre contenga `bookoo`, así que el puente en modo BooKoo debería funcionar con ella (pendiente de probar).
 

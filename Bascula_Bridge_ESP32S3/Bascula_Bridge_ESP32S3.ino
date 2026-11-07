@@ -60,7 +60,7 @@
 #define RECONNECT_INTERVAL_APP_MS     2000  // Pausa moderada (2s) entre escaneos cuando la App ya está conectada
 #define APP_HANDSHAKE_GRACE_MS        10000 // Pausa de escaneo (10s) cuando la App conecta para no interferir el Handshake
 #define ACAIA_NOTIFY_INTERVAL_MS      100   // Reenvío de "relleno" si la balanza no manda nada nuevo en 100 ms
-#define TIMEMORE_KEEPALIVE_INTERVAL_MS 25000 // 25s Keep-Alive para evitar auto-off de la Dot
+#define TIMEMORE_KEEPALIVE_INTERVAL_MS 10000 // Sondeo cada 10 s, como de1app (mantiene la Dot activa)
 
 // ----------------------------------------------------------------------------
 // AJUSTES DE BAJA LATENCIA (PIPELINE DIRIGIDO POR EVENTOS)
@@ -795,6 +795,66 @@ void applySoftwareTare() {
   postScaleEvent(SCL_EVT_TARE);
 }
 
+// ----------------------------------------------------------------------------
+// TRAMAS DE LA TIMEMORE DOT (servicio 0xFFF0: notify 0xFFF1, write 0xFFF2)
+// ----------------------------------------------------------------------------
+// Bytes EXACTOS usados por de1app (PR #345, decentespresso/de1app), extraídos
+// de capturas HCI de la app oficial de Timemore y probados con una Dot real.
+// Se envían tal cual: su longitud/cola no encaja con el CRC que calculaba
+// sendTimemoreOpenScaleFrame(), así que no se recalculan.
+static const uint8_t DOT_INIT_CMDS[][8] = {
+  { 0xA5, 0x5A, 0x02, 0x13, 0x00, 0x00, 0x00, 0x00 },
+  { 0xA5, 0x5A, 0x02, 0x08, 0x00, 0x00, 0x00, 0x00 },
+  { 0xA5, 0x5A, 0x02, 0x05, 0x00, 0x00, 0x00, 0x00 },
+  { 0xA5, 0x5A, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00 },
+  { 0xA5, 0x5A, 0x02, 0x06, 0x00, 0x00, 0x00, 0x00 },
+  { 0xA5, 0x5A, 0x02, 0x0C, 0x00, 0x00, 0x00, 0x00 },
+};
+static const uint8_t DOT_POLL_1[]       = { 0xA5, 0x5A, 0x02, 0x08, 0x00, 0x00, 0x00, 0x00 };
+static const uint8_t DOT_POLL_2[]       = { 0xA5, 0x5A, 0x03, 0x08, 0x00, 0x02, 0x01, 0x00, 0x00, 0x00, 0x25 };
+static const uint8_t DOT_TARE[]         = { 0xA5, 0x5A, 0x03, 0x0D, 0x00, 0x02, 0x00, 0x00, 0x00, 0x71 };
+static const uint8_t DOT_TIMER_START[]  = { 0xA5, 0x5A, 0x03, 0x02, 0x00, 0x01, 0x01, 0x00, 0x20 };
+static const uint8_t DOT_TIMER_STOP[]   = { 0xA5, 0x5A, 0x03, 0x02, 0x00, 0x01, 0x02, 0x00, 0xFF, 0xD0 };
+static const uint8_t DOT_TIMER_RESET[]  = { 0xA5, 0x5A, 0x03, 0x02, 0x00, 0x01, 0x03, 0x00, 0xFF, 0x81 };
+
+volatile bool scaleUsesDotService = false; // true si la balanza expone 0xFFF0 (Timemore Dot)
+
+static bool writeScaleRaw(const uint8_t* data, size_t len) {
+  NimBLERemoteCharacteristic* w = pScaleWriteChar;
+  if (!scaleConnected || w == nullptr) return false;
+  debugPrintHex("[TIMEMORE-TX]", data, len);
+  return w->writeValue(data, len, false);
+}
+
+// Secuencia de inicio de la app oficial (dos pasadas, 150 ms entre comandos) +
+// sondeo inicial. Solo desde scale_link: bloquea ~2.5 s sin afectar a la App.
+void sendTimemoreDotInitSequence() {
+  DBG_PRINTLN("[TIMEMORE-TX] Enviando secuencia de inicio de la Dot (app oficial)...");
+  for (int pass = 0; pass < 2; pass++) {
+    for (size_t i = 0; i < sizeof(DOT_INIT_CMDS) / sizeof(DOT_INIT_CMDS[0]); i++) {
+      if (!scaleConnected) return;
+      writeScaleRaw(DOT_INIT_CMDS[i], sizeof(DOT_INIT_CMDS[i]));
+      vTaskDelay(pdMS_TO_TICKS(150));
+    }
+    vTaskDelay(pdMS_TO_TICKS(300));
+  }
+}
+
+// Sondeo periódico (cada TIMEMORE_KEEPALIVE_INTERVAL_MS) que mantiene la Dot activa
+void sendTimemoreKeepAlive() {
+  if (!scaleConnected) return;
+  if (scaleUsesDotService) {
+    writeScaleRaw(DOT_POLL_1, sizeof(DOT_POLL_1));
+    vTaskDelay(pdMS_TO_TICKS(100));
+    writeScaleRaw(DOT_POLL_2, sizeof(DOT_POLL_2));
+  } else if (pScaleWriteChar != nullptr) {
+    // Otras variantes (0xFFE0 / 0x181D): sondeo genérico anterior
+    sendTimemoreOpenScaleFrame(0x02, 0x05, nullptr, 0);
+    sendTimemoreOpenScaleFrame(0x02, 0x02, nullptr, 0);
+  }
+  DBG_PRINTLN("[KEEP-ALIVE] Sondeo enviado a la Timemore.");
+}
+
 // Tara física en la Timemore (solo desde scale_link)
 void executeTimemoreTare() {
   if (!scaleConnected || pScaleWriteChar == nullptr) {
@@ -802,43 +862,58 @@ void executeTimemoreTare() {
     return;
   }
 
-  // 1. Comando de Tara Open Scale Protocol (0xA5 0x5A, Opcode 0x03, Cmd 0x0D)
-  sendTimemoreOpenScaleFrame(0x03, 0x0D, nullptr, 0);
-
-  // 2. Comando de Tara UART 0xFFE1/0xFFE2
-  const uint8_t uartTareCmd[] = { 0xAA, 0x02, 0x43, 0x00, 0x45 };
-  pScaleWriteChar->writeValue(uartTareCmd, sizeof(uartTareCmd), false);
-
-  DBG_PRINTLN("[TARA] Comando de TARA enviado a la Timemore Dot + respaldo 0.0g activo.");
+  if (scaleUsesDotService) {
+    // Igual que de1app: sondeo y, 200 ms después, el comando de tara
+    writeScaleRaw(DOT_POLL_1, sizeof(DOT_POLL_1));
+    vTaskDelay(pdMS_TO_TICKS(100));
+    writeScaleRaw(DOT_POLL_2, sizeof(DOT_POLL_2));
+    vTaskDelay(pdMS_TO_TICKS(100));
+    writeScaleRaw(DOT_TARE, sizeof(DOT_TARE));
+  } else {
+    // Variante UART 0xFFE1/0xFFE2
+    const uint8_t uartTareCmd[] = { 0xAA, 0x02, 0x43, 0x00, 0x45 };
+    writeScaleRaw(uartTareCmd, sizeof(uartTareCmd));
+  }
+  DBG_PRINTLN("[TARA] Comando de TARA enviado a la Timemore + respaldo 0.0g activo.");
 }
 
 void executeTimemoreTimerCommand(uint8_t action) {
-  if (!scaleConnected || pScaleWriteChar == nullptr) return;
+  if (!scaleConnected || pScaleWriteChar == nullptr || !scaleUsesDotService) return;
 
-  uint8_t timemoreCmd = 0x09; // Start
-  if (action == 1) timemoreCmd = 0x0A; // Stop
-  else if (action == 2) timemoreCmd = 0x0B; // Reset
+  const uint8_t* cmd = DOT_TIMER_START;
+  size_t len = sizeof(DOT_TIMER_START);
+  if (action == 1)      { cmd = DOT_TIMER_STOP;  len = sizeof(DOT_TIMER_STOP); }
+  else if (action == 2) { cmd = DOT_TIMER_RESET; len = sizeof(DOT_TIMER_RESET); }
 
-  sendTimemoreOpenScaleFrame(0x03, timemoreCmd, nullptr, 0);
-  DBG_PRINTF("[TIMEMORE-TX] Comando de Timer enviado (accion=%u -> cmd=0x%02X).", action, timemoreCmd);
+  writeScaleRaw(cmd, len);
+  DBG_PRINTF("[TIMEMORE-TX] Comando de Timer enviado (accion=%u: %s).", action,
+             action == 0 ? "start" : (action == 1 ? "stop" : "reset"));
 }
 
-void sendTimemoreKeepAlive() {
-  if (!scaleConnected) return;
-
-  if (pScaleWriteChar != nullptr) {
-    // Solicitud de lectura de batería (Opcode 0x02, Cmd 0x05) y Timer (Opcode 0x02, Cmd 0x02)
-    sendTimemoreOpenScaleFrame(0x02, 0x05, nullptr, 0);
-    sendTimemoreOpenScaleFrame(0x02, 0x02, nullptr, 0);
-  }
-  if (pScaleNotifyChar != nullptr && pScaleNotifyChar->canRead()) {
-    pScaleNotifyChar->readValue();
-  }
-  DBG_PRINTLN("[KEEP-ALIVE] Pulso Anti Auto-Off enviado a la Timemore Dot.");
-}
+// Captura de las primeras tramas de peso de cada conexión, para comparar con la
+// pantalla de la Dot. El callback solo hace memcpy; loop() las imprime.
+static constexpr uint8_t DBG_FRAME_SLOTS = 3;
+static constexpr uint8_t DBG_FRAME_MAX   = 24;
+uint8_t dbgFrames[DBG_FRAME_SLOTS][DBG_FRAME_MAX];
+uint8_t dbgFrameLens[DBG_FRAME_SLOTS];
+float dbgFrameWeights[DBG_FRAME_SLOTS];
+volatile uint8_t dbgFrameCount   = 0; // Escrito por el callback
+uint8_t dbgFramesPrinted         = 0; // Solo loop
 
 bool parseTimemorePayload(const uint8_t* data, size_t len, float& outWeightGrams, bool& outStable, uint8_t& inoutBattery) {
   if (data == nullptr || len < 4) return false;
+
+  // CASO 0: Timemore Dot (formato verificado por de1app con hardware real):
+  //   A5 5A [tipo] [estado] .. .. .. .. [WH] [WL] ...
+  //   tipo 0x01 = peso; peso = int16 big-endian en bytes 8-9, en 0.1 g.
+  //   tipo 0x02 (respuesta) y 0x03 (ACK) no llevan peso.
+  if (scaleUsesDotService && len >= 10 && data[0] == 0xA5 && data[1] == 0x5A) {
+    if (data[2] != 0x01) return false;
+    int16_t raw16 = static_cast<int16_t>((static_cast<uint16_t>(data[8]) << 8) | data[9]);
+    outWeightGrams = static_cast<float>(raw16) / 10.0f;
+    outStable = true;
+    return true;
+  }
 
   // CASO A: Timemore Open Scale Protocol (0xA5, 0x5A)
   if (len >= 8 && data[0] == 0xA5 && data[1] == 0x5A) {
@@ -972,6 +1047,16 @@ void onTimemoreNotifyCallback(NimBLERemoteCharacteristic* pRemoteCharacteristic,
     // Batería solo desde tramas de peso (como antes). El byte de la respuesta 0x05
     // de la Dot NO es un porcentaje (con batería llena reporta 3), así que se ignora.
     scaleBatteryPct = batt;
+
+    // Captura de las primeras tramas (solo memcpy; las imprime loop())
+    uint8_t slot = dbgFrameCount;
+    if (slot < DBG_FRAME_SLOTS) {
+      size_t n = (length < DBG_FRAME_MAX) ? length : DBG_FRAME_MAX;
+      memcpy(dbgFrames[slot], pData, n);
+      dbgFrameLens[slot]    = static_cast<uint8_t>(n);
+      dbgFrameWeights[slot] = parsedWeight;
+      dbgFrameCount         = slot + 1;
+    }
     unsigned long arrivalMs = millis();
 
     portENTER_CRITICAL(&sampleMux);
@@ -1889,28 +1974,31 @@ void startTimemoreScan() {
 }
 
 bool discoverAndSubscribeTimemore(NimBLEClient* pClient) {
-  pScaleNotifyChar = nullptr;
-  pScaleWriteChar  = nullptr;
+  pScaleNotifyChar    = nullptr;
+  pScaleWriteChar     = nullptr;
+  scaleUsesDotService = false;
 
-  // 1. Servicio primario Timemore Dot 0xFFE0 -> Char 0xFFE1
-  NimBLERemoteService* pSvc = pClient->getService(NimBLEUUID(UUID16_TIMEMORE_SVC_FFE0));
+  // 1. Servicio de la Timemore Dot 0xFFF0 -> 0xFFF1 (Notify) / 0xFFF2 (Write)
+  //    Es el que usa de1app (verificado con hardware real), por eso va primero.
+  NimBLERemoteService* pSvc = pClient->getService(NimBLEUUID(UUID16_TIMEMORE_SVC_FFF0));
   if (pSvc != nullptr) {
-    DBG_PRINTLN("[TIMEMORE-CLI] Servicio 0xFFE0 descubierto.");
-    pScaleNotifyChar = pSvc->getCharacteristic(NimBLEUUID(UUID16_TIMEMORE_CHR_FFE1));
-    pScaleWriteChar  = pSvc->getCharacteristic(NimBLEUUID(UUID16_TIMEMORE_CHR_FFE2));
-    if (pScaleWriteChar == nullptr && pScaleNotifyChar != nullptr &&
-        (pScaleNotifyChar->canWrite() || pScaleNotifyChar->canWriteNoResponse())) {
-      pScaleWriteChar = pScaleNotifyChar;
-    }
+    DBG_PRINTLN("[TIMEMORE-CLI] Servicio Timemore Dot 0xFFF0 descubierto.");
+    pScaleNotifyChar = pSvc->getCharacteristic(NimBLEUUID(UUID16_TIMEMORE_CHR_FFF1));
+    pScaleWriteChar  = pSvc->getCharacteristic(NimBLEUUID(UUID16_TIMEMORE_CHR_FFF2));
+    scaleUsesDotService = (pScaleNotifyChar != nullptr);
   }
 
-  // 2. Fallback Servicio Timemore Open Scale Protocol 0xFFF0 -> 0xFFF1 (Notify) / 0xFFF2 (Write)
+  // 2. Fallback: variante UART 0xFFE0 -> 0xFFE1 / 0xFFE2
   if (pScaleNotifyChar == nullptr) {
-    pSvc = pClient->getService(NimBLEUUID(UUID16_TIMEMORE_SVC_FFF0));
+    pSvc = pClient->getService(NimBLEUUID(UUID16_TIMEMORE_SVC_FFE0));
     if (pSvc != nullptr) {
-      DBG_PRINTLN("[TIMEMORE-CLI] Servicio Open Scale 0xFFF0 descubierto.");
-      pScaleNotifyChar = pSvc->getCharacteristic(NimBLEUUID(UUID16_TIMEMORE_CHR_FFF1));
-      pScaleWriteChar  = pSvc->getCharacteristic(NimBLEUUID(UUID16_TIMEMORE_CHR_FFF2));
+      DBG_PRINTLN("[TIMEMORE-CLI] Servicio UART 0xFFE0 descubierto.");
+      pScaleNotifyChar = pSvc->getCharacteristic(NimBLEUUID(UUID16_TIMEMORE_CHR_FFE1));
+      pScaleWriteChar  = pSvc->getCharacteristic(NimBLEUUID(UUID16_TIMEMORE_CHR_FFE2));
+      if (pScaleWriteChar == nullptr && pScaleNotifyChar != nullptr &&
+          (pScaleNotifyChar->canWrite() || pScaleNotifyChar->canWriteNoResponse())) {
+        pScaleWriteChar = pScaleNotifyChar;
+      }
     }
   }
 
@@ -2067,13 +2155,26 @@ bool connectToTimemoreScale(const char* macStr, uint8_t addrType, uint32_t timeo
 
   saveScaleToNVS(macStr, connectedAddrType);
 
-  // Solicitar estado inicial de peso (Cmd 0x01) + batería/timer Keep-Alive
-  sendTimemoreOpenScaleFrame(0x02, 0x01, nullptr, 0);
-  sendTimemoreKeepAlive();
-
+  // Reanudar Advertising ANTES de la secuencia de inicio (~2.5 s), para que la
+  // máquina/App pueda descubrir el puente mientras tanto.
   if (!appConnected) {
     NimBLEDevice::startAdvertising();
   }
+
+  // Volver a capturar las primeras tramas de peso de esta conexión
+  dbgFrameCount    = 0;
+  dbgFramesPrinted = 0;
+
+  if (scaleUsesDotService) {
+    // Secuencia de la app oficial + sondeo inicial (igual que de1app)
+    sendTimemoreDotInitSequence();
+    sendTimemoreKeepAlive();
+  } else {
+    // Otras variantes: solicitud de peso inicial + sondeo genérico
+    sendTimemoreOpenScaleFrame(0x02, 0x01, nullptr, 0);
+    sendTimemoreKeepAlive();
+  }
+  lastKeepAliveMs = millis();
 
   DBG_PRINTF("[TIMEMORE-CLI] >>> CONEXION EXITOSA con Timemore Dot (%s, tipo=%u) <<<",
              macStr, connectedAddrType);
@@ -2679,6 +2780,20 @@ void loop() {
   pollBootButtonRuntime();
   pollSerialDebugCommands();
   updateStatusLed();
+
+  // Primeras tramas de peso de la conexión: bytes crudos + peso interpretado,
+  // para comparar con la pantalla de la Dot.
+  while (dbgFramesPrinted < dbgFrameCount) {
+    uint8_t i = dbgFramesPrinted++;
+    char hex[DBG_FRAME_MAX * 3 + 1];
+    size_t p = 0;
+    for (uint8_t b = 0; b < dbgFrameLens[i]; b++) {
+      p += snprintf(&hex[p], sizeof(hex) - p, "%02X ", dbgFrames[i][b]);
+    }
+    hex[p] = '\0';
+    DBG_PRINTF("[TIMEMORE-RX] Trama de peso %u/%u: %s-> %.1f g (servicio %s)", i + 1, DBG_FRAME_SLOTS,
+               hex, dbgFrameWeights[i], scaleUsesDotService ? "0xFFF0" : "otro");
+  }
 
   unsigned long now = millis();
   if (now - lastSerialStatusMs >= SERIAL_STATUS_INTERVAL_MS) {
