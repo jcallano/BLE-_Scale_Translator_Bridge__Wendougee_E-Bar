@@ -59,7 +59,12 @@
 #define RECONNECT_INTERVAL_FAST_MS    800   // Pausa corta (0.8s) entre escaneos cuando la App aún no está conectada
 #define RECONNECT_INTERVAL_APP_MS     2000  // Pausa moderada (2s) entre escaneos cuando la App ya está conectada
 #define APP_HANDSHAKE_GRACE_MS        10000 // Pausa de escaneo (10s) cuando la App conecta para no interferir el Handshake
-#define ACAIA_NOTIFY_INTERVAL_MS      100   // Reenvío de "relleno" si la balanza no manda nada nuevo en 100 ms
+#define ACAIA_NOTIFY_INTERVAL_MS      100   // Periodo del timer Acaia (10 Hz)
+// Relleno: reenvía el último peso solo si la balanza lleva este tiempo sin mandar
+// nada. Debe ser claramente mayor que el periodo de la Dot (100 ms ± jitter): con
+// 100 ms el relleno salía justo antes de la muestra real y la retrasaba hasta
+// WEIGHT_MIN_GAP_MS (picos de ~10 ms medidos).
+#define WEIGHT_FILLER_IDLE_MS         250
 #define TIMEMORE_KEEPALIVE_INTERVAL_MS 10000 // Sondeo cada 10 s, como de1app (mantiene la Dot activa)
 
 // ----------------------------------------------------------------------------
@@ -2475,9 +2480,10 @@ void setup() {
  * un comando de la App o vence un plazo (relleno de 100 ms, timer, ritmo mínimo).
  *
  * Reglas de transmisión (máximo 1 paquete por ranura de HANDSHAKE_PACING_MS):
- *   1. Peso nuevo (si pasaron >= WEIGHT_MIN_GAP_MS desde el anterior) -> prioridad máxima
+ *   1. Peso nuevo (si pasaron >= WEIGHT_MIN_GAP_MS desde el anterior peso NUEVO;
+ *      los rellenos no cuentan) -> prioridad máxima
  *   2. Handshake: Heartbeat ACK > INFO > STATUS > ACK evento > Timer inmediato
- *   3. Relleno de peso si no se envió nada en ACAIA_NOTIFY_INTERVAL_MS
+ *   3. Relleno de peso si no se envió ningún peso en WEIGHT_FILLER_IDLE_MS
  *   4. Timer Acaia a 10 Hz mientras corre
  * Todos los plazos se actualizan al INTENTAR enviar (aunque el stack rechace el
  * paquete), así la tarea nunca entra en un bucle activo.
@@ -2487,7 +2493,8 @@ void bridgeTaskFn(void* arg) {
   static constexpr uint32_t PACING_US = HANDSHAKE_PACING_MS * 1000UL;
 
   uint32_t pending             = 0;
-  unsigned long lastWeightTxMs = 0;
+  unsigned long lastWeightTxMs = 0; // Cualquier peso (nuevo o relleno): controla el relleno
+  unsigned long lastLiveTxMs   = 0; // Solo pesos nuevos: controla WEIGHT_MIN_GAP_MS
   unsigned long lastTimerTxMs  = 0;
   uint32_t lastAnyTxUs         = 0;
   unsigned long prevSampleMs   = 0;
@@ -2499,8 +2506,9 @@ void bridgeTaskFn(void* arg) {
     TickType_t waitTicks = pdMS_TO_TICKS(ACAIA_NOTIFY_INTERVAL_MS);
     if (appConnected) {
       unsigned long now = millis();
-      uint32_t sinceW = now - lastWeightTxMs;
-      uint32_t waitMs = (sinceW >= ACAIA_NOTIFY_INTERVAL_MS) ? 0 : (ACAIA_NOTIFY_INTERVAL_MS - sinceW);
+      uint32_t sinceW    = now - lastWeightTxMs;
+      uint32_t sinceLive = now - lastLiveTxMs;
+      uint32_t waitMs = (sinceW >= WEIGHT_FILLER_IDLE_MS) ? 0 : (WEIGHT_FILLER_IDLE_MS - sinceW);
       if (timerRunning) {
         uint32_t sinceT = now - lastTimerTxMs;
         uint32_t tIn = (sinceT >= ACAIA_NOTIFY_INTERVAL_MS) ? 0 : (ACAIA_NOTIFY_INTERVAL_MS - sinceT);
@@ -2508,7 +2516,7 @@ void bridgeTaskFn(void* arg) {
       }
       if (pending & HS_MASK) waitMs = 0;
       if (pending & EVT_WEIGHT_IMM) {
-        uint32_t gIn = (sinceW >= WEIGHT_MIN_GAP_MS) ? 0 : (WEIGHT_MIN_GAP_MS - sinceW);
+        uint32_t gIn = (sinceLive >= WEIGHT_MIN_GAP_MS) ? 0 : (WEIGHT_MIN_GAP_MS - sinceLive);
         if (gIn < waitMs) waitMs = gIn;
       }
       uint32_t sinceAnyUs = static_cast<uint32_t>(esp_timer_get_time()) - lastAnyTxUs;
@@ -2584,8 +2592,10 @@ void bridgeTaskFn(void* arg) {
     unsigned long now = millis();
 
     bool sendWeight = false;
-    if ((pending & EVT_WEIGHT_IMM) && (now - lastWeightTxMs >= WEIGHT_MIN_GAP_MS)) {
+    bool isLive     = false;
+    if ((pending & EVT_WEIGHT_IMM) && (now - lastLiveTxMs >= WEIGHT_MIN_GAP_MS)) {
       sendWeight = true;
+      isLive     = true;
     } else if (pending & HS_MASK) {
       if (pending & EVT_HB_ACK)         { pending &= ~EVT_HB_ACK;    sendAcaiaHeartbeatAck(); }
       else if (pending & EVT_INFO)      { pending &= ~EVT_INFO;      sendAcaiaInfoPacket(); }
@@ -2594,8 +2604,8 @@ void bridgeTaskFn(void* arg) {
       else                              { pending &= ~EVT_TIMER_IMM; sendAcaiaTimerNotification(); lastTimerTxMs = now; }
       lastAnyTxUs = nowUs;
       continue;
-    } else if (now - lastWeightTxMs >= ACAIA_NOTIFY_INTERVAL_MS) {
-      sendWeight = true; // Relleno: la balanza no mandó nada nuevo en 100 ms
+    } else if (now - lastWeightTxMs >= WEIGHT_FILLER_IDLE_MS) {
+      sendWeight = true; // Relleno: no salió ningún peso en WEIGHT_FILLER_IDLE_MS
     } else if (timerRunning && (now - lastTimerTxMs >= ACAIA_NOTIFY_INTERVAL_MS)) {
       sendAcaiaTimerNotification();
       lastTimerTxMs = now;
@@ -2607,6 +2617,7 @@ void bridgeTaskFn(void* arg) {
       pending &= ~EVT_WEIGHT_IMM;
       bool ok = sendAcaiaWeightNotification(currentWeightGrams, weightIsStable);
       lastWeightTxMs = now;
+      if (isLive) lastLiveTxMs = now;
       lastAnyTxUs    = nowUs;
 #if ENABLE_LATENCY_STATS
       uint32_t doneUs = static_cast<uint32_t>(esp_timer_get_time());

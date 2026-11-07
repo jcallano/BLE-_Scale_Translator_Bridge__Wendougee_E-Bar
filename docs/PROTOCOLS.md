@@ -82,7 +82,7 @@ Reverse engineering of the official **Wendougee E-Bar** Android app and **[`drob
 | `7..26` | **20 B** | `0x09` | `13 09 42 4F 4F 4B 4F 4F 5F 53 43 5F 55 20 XX XX XX XX XX XX` | **Complete Local Name:** `"BOOKOO_SC_U XXXXXX"` (18 ASCII chars) |
 
 ### 2.3. 20-Byte Weight & Flow Telemetry Frame (`0x0FFE -> 0xFF11`)
-Transmitted once per scale sample (the Dot streams at 10 Hz), with a 100 ms filler if the scale is silent, per [`BooKooCode/OpenSource/bookoo_ultra_scale/protocols.md`](https://github.com/BooKooCode/OpenSource/blob/main/bookoo_ultra_scale/protocols.md):
+Transmitted once per scale sample (the Dot streams at 10 Hz), with a filler packet if the scale is silent for 250 ms, per [`BooKooCode/OpenSource/bookoo_ultra_scale/protocols.md`](https://github.com/BooKooCode/OpenSource/blob/main/bookoo_ultra_scale/protocols.md):
 
 | Byte | Value / Encoding | Description |
 | :---: | :---: | :--- |

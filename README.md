@@ -15,7 +15,7 @@ The **Timemore Black Mirror Dot** uses a proprietary BLE protocol (service `0xFF
 
 - **Simultaneous Dual-Role BLE Architecture (Central + Peripheral):**
   - **BLE Central (Input):** Automatically discovers, pairs with, and streams real-time weight data from the **Timemore Black Mirror Dot** (service `0xFFF0`). On connect it replays the official Timemore app's init sequence and then polls the scale every 10 seconds to prevent auto-off (same protocol as the native Dot support in de1app).
-  - **BLE Peripheral (Output):** Emulates either a **BooKoo Themis Ultra** (`BOOKOO_SC_U XXXXXX`, default) or an **Acaia Lunar** (`ACAIA_L_XXXX`). Each sample from the scale (10 Hz) is forwarded immediately, with a 100 ms filler packet only if the scale goes quiet.
+  - **BLE Peripheral (Output):** Emulates either a **BooKoo Themis Ultra** (`BOOKOO_SC_U XXXXXX`, default) or an **Acaia Lunar** (`ACAIA_L_XXXX`). Each sample from the scale (10 Hz) is forwarded immediately, with a filler packet only if the scale goes quiet for 250 ms.
 - **Low-Latency Multicore Pipeline (ESP32-S3 dual core):** see [Low-Latency Architecture](#low-latency-architecture). Measured internal latency (sample arrives at the ESP32 → notification handed to the BLE stack): **~0.33 ms average, < 0.7 ms worst case**.
 - **Broad Ecosystem Compatibility:**
   - **Wendougee Espresso Machines (Data-S / Lita):** Full compatibility with the espresso machine's internal BLE controller and both the official **Wendougee E-Bar** app and the community **[GeeFlow](https://github.com/drobekk/GeeFlow)** app (populates Modbus Holding Registers `1415 WEIGHT` and `1423 WEIGHT_RATE` with real-time weight and EMA-smoothed flow rate).
@@ -81,7 +81,7 @@ The firmware uses both cores of the ESP32-S3 explicitly (FreeRTOS SMP):
 
 **Pipeline details**
 - Events between tasks use FreeRTOS notification bits (atomic, no lost events).
-- Every new sample is forwarded immediately; a minimum gap of 15 ms between weight packets (`WEIGHT_MIN_GAP_MS`) protects the ATT queue. A 100 ms filler packet is only sent if the scale is silent.
+- Every new sample is forwarded immediately; a minimum gap of 15 ms between weight packets (`WEIGHT_MIN_GAP_MS`) protects the ATT queue. A filler packet repeats the last weight only if no weight was sent for 250 ms (`WEIGHT_FILLER_IDLE_MS`); fillers do not count toward the 15 ms gap, so they never delay a real sample.
 - Notifications are sent directly to the app's connection handle (no per-packet heap allocation).
 - Link tuning after connect: scale link 15 ms interval (we are central), app link 15–30 ms requested (iOS/Android compliant) and re-requested up to 3 times if the central ignores it, plus 2M PHY on both links. Tuning is delayed (1.5 s scale / 3 s app) to avoid colliding with SMP encryption or the app's GATT discovery.
 

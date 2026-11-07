@@ -426,7 +426,7 @@ Antes, toda la lógica corría en `loop()` (core 1, prioridad 1) con un `delay(3
 ### 7.2. Pipeline dirigido por eventos
 
 - Los callbacks no envían nada: publican eventos con **bits de notificación FreeRTOS** (`postBridgeEvent()` / `postScaleEvent()`), que son atómicos y no pierden eventos (las antiguas banderas `pending*` sí podían perderlos entre núcleos).
-- **Envío inmediato:** cada muestra nueva se reenvía en cuanto llega. El reenvío cada 100 ms queda solo como **relleno** si la balanza no manda nada. Entre dos pesos hay al menos `WEIGHT_MIN_GAP_MS` (15 ms) para no saturar la cola ATT, y entre dos paquetes cualesquiera al menos `HANDSHAKE_PACING_MS` (2 ms).
+- **Envío inmediato:** cada muestra nueva se reenvía en cuanto llega. El **relleno** (reenviar el último peso) solo sale si no se envió ningún peso en 250 ms (`WEIGHT_FILLER_IDLE_MS`). Con un relleno de 100 ms, este salía justo antes de la muestra real y la retrasaba hasta 15 ms (medido: media 3.7 ms, picos de 10.6 ms). Entre dos pesos **nuevos** hay al menos `WEIGHT_MIN_GAP_MS` (15 ms); los rellenos no cuentan, para no saturar la cola ATT, y entre dos paquetes cualesquiera al menos `HANDSHAKE_PACING_MS` (2 ms).
 - **Prioridad de envío:** peso nuevo > Heartbeat ACK > INFO > STATUS > ACK de evento > timer inmediato > relleno > timer a 10 Hz.
 - **Caudal (g/s):** se calcula una vez por muestra real, con su marca de tiempo de llegada (dt exacto, sin jitter del planificador), con EMA `FLOW_EMA_ALPHA = 0.35`.
 - **Timer Acaia:** tiene su propio reloj a 10 Hz (antes iba atado al relleno de peso y se congelaba con el envío inmediato).
