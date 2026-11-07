@@ -13,20 +13,23 @@
  *    el paquete de Advertising ocupe 21 bytes (<= 31 bytes límite BLE) y coloque
  *    0xFF08 en la lista pública de 16 bits (AD Type 0x03) sin desbordar buffer.
  * 3. Callbacks BLE 100% libres de bloqueo y sin re-entrada (ningún notify(),
- *    writeValue() ni scan->stop() se invoca dentro del contexto de interrupción
- *    de nimble_host; todo se despacha por banderas atómicas en el loop).
+ *    writeValue() ni scan->stop() se invoca dentro del contexto de nimble_host);
+ *    todo se despacha con bits de notificación FreeRTOS (sin pérdida de eventos)
+ *    a dos tareas: bridge_tx (core 0, emisor único hacia la App) y scale_link
+ *    (core 1, enlace bloqueante con la Timemore). Ver "ARQUITECTURA MULTINÚCLEO".
  * 4. Controlador WS2812 (GPIO 21) con caché de estado RGB: solo invoca al
  *    periférico RMT (rgbLedWrite) cuando el color realmente cambia, evitando
  *    colisiones de RMT/DMA con el stack BLE en Core 3.x.
  * 5. Telemetría y mensajes de Debug detallados por Puerto Serial (USB CDC) con
  *    diagnóstico de causa de reinicio, trazas de paquetes BLE y comandos
- *    interactivos por monitor serie ('?', 't', 'r', 's').
+ *    interactivos por monitor serie ('?', 'l', 't', 'r', 's', 'p').
  * ============================================================================
  */
 
 #include <Arduino.h>
 #include <Preferences.h>
 #include <NimBLEDevice.h>
+#include <esp_timer.h>
 #if __has_include(<esp_mac.h>)
   #include <esp_mac.h>
 #endif
@@ -56,9 +59,68 @@
 #define RECONNECT_INTERVAL_FAST_MS    800   // Pausa corta (0.8s) entre escaneos cuando la App aún no está conectada
 #define RECONNECT_INTERVAL_APP_MS     2000  // Pausa moderada (2s) entre escaneos cuando la App ya está conectada
 #define APP_HANDSHAKE_GRACE_MS        10000 // Pausa de escaneo (10s) cuando la App conecta para no interferir el Handshake
-#define ACAIA_NOTIFY_INTERVAL_MS      100   // 10 Hz (100 ms) frecuencia de envío Acaia
+#define ACAIA_NOTIFY_INTERVAL_MS      100   // Reenvío de "relleno" si la balanza no manda nada nuevo en 100 ms
 #define TIMEMORE_KEEPALIVE_INTERVAL_MS 25000 // 25s Keep-Alive para evitar auto-off de la Dot
+
+// ----------------------------------------------------------------------------
+// AJUSTES DE BAJA LATENCIA (PIPELINE DIRIGIDO POR EVENTOS)
+// ----------------------------------------------------------------------------
+// Cada muestra nueva de la Timemore se reenvía en cuanto llega (la tarea loop se
+// despierta por notificación FreeRTOS, sin esperar al siguiente tick de 100 ms).
+// WEIGHT_MIN_GAP_MS limita la frecuencia máxima de salida para no saturar la cola
+// ATT del host (15 ms ≈ 1 intervalo de conexión con la App -> máx ~66 Hz).
+#define WEIGHT_MIN_GAP_MS             15
+// Intervalos de conexión BLE (unidades de 1.25 ms). Se piden DESPUÉS de conectar.
+// Balanza (somos Central -> lo imponemos): 15 ms fijos (antes 30-50 ms).
+#define SCALE_CONN_ITVL_MIN           12
+#define SCALE_CONN_ITVL_MAX           12
+// App/Máquina (somos Periférico -> solo lo solicitamos): 15-30 ms.
+// Cumple las reglas de Apple/Android (mín >= 15 ms, máx >= mín + 15 ms); una
+// petición fuera de esas reglas (p.ej. 10-20 ms) se rechaza entera y el central
+// se queda con su valor por defecto (se observó 60 ms).
+#define APP_CONN_ITVL_MIN             12
+#define APP_CONN_ITVL_MAX             24
+// Si el central no aplicó el intervalo, se vuelve a pedir tras el handshake
+// (algunos centrales rechazan cambios durante el descubrimiento GATT).
+#define APP_ITVL_RETRY_MAX            3
+#define APP_ITVL_RETRY_PERIOD_MS      5000
+// Suavizado EMA del caudal (0..1). Más alto = menos retardo, más ruido.
+// El EMA se calcula ahora por cada muestra real de la balanza, con su timestamp.
+#define FLOW_EMA_ALPHA                0.35f
+#define FLOW_MIN_DT_MS                40    // Ignora muestras más juntas que esto para el cálculo de caudal
 #define SERIAL_STATUS_INTERVAL_MS     5000  // Resumen de estado por Serial cada 5s
+
+// ----------------------------------------------------------------------------
+// ARQUITECTURA MULTINÚCLEO (FreeRTOS SMP del ESP32-S3)
+// ----------------------------------------------------------------------------
+// Core 0: Controlador BT + nimble_host (prio 21) + bridge_tx (prio 20)
+//         -> bridge_tx es la ÚNICA tarea que transmite a la App. Corre en el mismo
+//            núcleo que nimble_host: la muestra de la balanza se reenvía en cuanto
+//            el callback termina, sin salto entre núcleos.
+// Core 1: scale_link (prio 3): escaneo, connect() bloqueante, descubrimiento GATT,
+//            keep-alive y escrituras hacia la Timemore. Puede bloquear segundos
+//            sin afectar al handshake ni al streaming hacia la App.
+//         loop() (prio 1): LED, botón, comandos Serial y estadísticas.
+#define BRIDGE_TASK_CORE              0
+#define BRIDGE_TASK_PRIO              (configMAX_PRIORITIES - 5)
+#define BRIDGE_TASK_STACK             6144
+#define SCALE_TASK_CORE               1
+#define SCALE_TASK_PRIO               3
+#define SCALE_TASK_STACK              8192
+#define HANDSHAKE_PACING_MS           2     // Separación entre paquetes de handshake consecutivos
+
+// Ajuste de enlace diferido (evita colisiones de procedimientos LL con el cifrado
+// SMP o con el descubrimiento GATT de la App justo después de conectar).
+#define SCALE_LINK_TUNE_DELAY_MS      1500  // Tras conectar la Timemore: intervalo corto + PHY
+#define APP_LINK_TUNE_DELAY_MS        3000  // Tras conectar la App: PHY
+// PHY 2M: mitad de tiempo en el aire por paquete. Si un periférico no lo soporta,
+// el enlace sigue en 1M sin problema. Poner a 0 si se observa inestabilidad.
+#define ENABLE_2M_PHY_SCALE           1
+#define ENABLE_2M_PHY_APP             1
+
+// Instrumentación de latencia: solo marcas de tiempo en µs y contadores en RAM
+// (decenas de ciclos por muestra). Se imprime cada 5 s desde loop() en el core 1.
+#define ENABLE_LATENCY_STATS          1
 
 // Resolución reportada en protocolo Acaia: 1 = 0.1g (x10), 2 = 0.01g (x100)
 #define ACAIA_WEIGHT_UNIT_MODE        1
@@ -190,16 +252,33 @@ volatile bool appNotificationsEnabled    = false;
 volatile bool pendingRestartAdvertising  = false;
 volatile unsigned long appHandshakeGraceUntilMs = 0;
 
-// Banderas diferidas para responder al Handshake Acaia fuera del callback BLE
-volatile bool pendingAcaiaHeartbeatAck   = false;
-volatile bool pendingAcaiaInfoPacket     = false;
-volatile bool pendingAcaiaStatusPacket   = false;
-volatile bool pendingAcaiaAckEvent       = false;
-volatile bool pendingAcaiaWeightImmediate = false;
-volatile bool pendingAcaiaTimerImmediate = false;
+volatile uint16_t appConnHandle          = 0xFFFF; // BLE_HS_CONN_HANDLE_NONE
+volatile unsigned long appConnectedAtMs  = 0;
+volatile bool appLinkTuned               = true;
 
-// Banderas diferidas hacia la Timemore Dot
-volatile bool pendingScaleTare           = false;
+// ----------------------------------------------------------------------------
+// EVENTOS ENTRE TAREAS (bits de notificación FreeRTOS: atómicos, sin pérdidas)
+// ----------------------------------------------------------------------------
+// Hacia bridge_tx (core 0):
+static constexpr uint32_t EVT_SAMPLE      = 1u << 0; // Muestra nueva de la Timemore
+static constexpr uint32_t EVT_HB_ACK      = 1u << 1; // Responder Heartbeat Acaia
+static constexpr uint32_t EVT_INFO        = 1u << 2; // Enviar paquete INFO
+static constexpr uint32_t EVT_STATUS      = 1u << 3; // Enviar paquete STATUS
+static constexpr uint32_t EVT_ACK_EVENT   = 1u << 4; // Enviar evento ACK
+static constexpr uint32_t EVT_TIMER_IMM   = 1u << 5; // Enviar timer ya
+static constexpr uint32_t EVT_WEIGHT_IMM  = 1u << 6; // Enviar peso ya
+static constexpr uint32_t EVT_TARE        = 1u << 7; // Tara (software inmediata + física diferida)
+static constexpr uint32_t EVT_APP_TX_MASK = EVT_HB_ACK | EVT_INFO | EVT_STATUS | EVT_ACK_EVENT |
+                                            EVT_TIMER_IMM | EVT_WEIGHT_IMM;
+// Hacia scale_link (core 1):
+static constexpr uint32_t SCL_EVT_WAKE      = 1u << 0; // Cambió el estado (escaneo/desconexión/App)
+static constexpr uint32_t SCL_EVT_TARE      = 1u << 1; // Enviar tara física a la Timemore
+static constexpr uint32_t SCL_EVT_TIMER     = 1u << 2; // Enviar comando de timer (pendingTimerCmd)
+static constexpr uint32_t SCL_EVT_NVS_RESET = 1u << 3; // Borrar MAC/bonds y reescanear
+static constexpr uint32_t SCL_EVT_SCAN      = 1u << 4; // Forzar escaneo (comando 's')
+
+TaskHandle_t bridgeTaskHandle            = nullptr;
+TaskHandle_t scaleTaskHandle             = nullptr;
 volatile uint8_t pendingTimerCmd         = 0xFF; // 0=Start, 1=Stop, 2=Reset, 0xFF=None
 
 // Telemetría de peso y batería
@@ -209,6 +288,15 @@ volatile float currentWeightGrams        = 0.0f;
 volatile float currentFlowRateGps        = 0.0f;
 float prevFlowWeightGrams                = 0.0f;
 unsigned long prevFlowCalcMs             = 0;
+
+// Pipeline de baja latencia: el callback BLE publica la muestra con su timestamp
+// y despierta a bridge_tx; bridge_tx calcula caudal y envía de inmediato.
+static portMUX_TYPE sampleMux            = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t scaleSampleSeq         = 0;   // Se incrementa con cada muestra nueva
+volatile unsigned long scaleSampleMs     = 0;   // millis() en que llegó la muestra
+volatile uint32_t scaleSampleUs          = 0;   // esp_timer (µs) en que llegó la muestra
+uint32_t processedSampleSeq              = 0;   // Solo bridge_tx
+volatile bool flowResetRequested         = false;
 volatile bool weightIsStable             = true;
 volatile uint8_t scaleBatteryPct         = 90;
 volatile uint32_t timemorePacketsRxCount = 0;
@@ -219,10 +307,50 @@ bool timerRunning                        = false;
 unsigned long timerStartMillis           = 0;
 unsigned long timerAccumulatedMs         = 0;
 
-// Temporizadores de bucle
-unsigned long lastAcaiaNotifyMs          = 0;
-unsigned long lastKeepAliveMs            = 0;
-unsigned long lastSerialStatusMs         = 0;
+// Temporizadores
+unsigned long lastKeepAliveMs            = 0;   // Solo scale_link
+unsigned long lastSerialStatusMs         = 0;   // Solo loop
+volatile unsigned long scaleConnectedAtMs = 0;
+volatile bool scaleLinkTuned             = true;
+volatile unsigned long resetBlinkUntilMs = 0;   // Parpadeo magenta no bloqueante tras borrar NVS
+
+// ----------------------------------------------------------------------------
+// ESTADÍSTICAS DE LATENCIA (escritas solo por bridge_tx, leídas y reiniciadas por loop)
+// ----------------------------------------------------------------------------
+struct LatencyStats {
+  uint32_t samples;        // Muestras procesadas
+  uint32_t coalesced;      // Muestras pisadas antes de procesarse (llegaron 2 seguidas)
+  uint32_t wakeMinUs, wakeMaxUs; uint64_t wakeSumUs;   // Llegada -> bridge_tx procesando
+  uint32_t e2eMinUs,  e2eMaxUs;  uint64_t e2eSumUs;    // Llegada -> notify() entregado al stack
+  uint32_t e2eCount;
+  uint32_t hist[5];        // e2e: <250us, <1ms, <5ms, <15ms, >=15ms
+  uint32_t dtMinMs, dtMaxMs; uint64_t dtSumMs; uint32_t dtCount; // Intervalo entre muestras
+  uint32_t txWeight;       // Notificaciones de peso enviadas
+  uint32_t txFail;         // notify() rechazados por el stack (sin buffers)
+};
+static portMUX_TYPE statsMux             = portMUX_INITIALIZER_UNLOCKED;
+static LatencyStats latStats;
+volatile uint32_t notifyFailTotal        = 0;
+
+static inline void resetLatencyStats(LatencyStats& s) {
+  memset(&s, 0, sizeof(s));
+  s.wakeMinUs = UINT32_MAX;
+  s.e2eMinUs  = UINT32_MAX;
+  s.dtMinMs   = UINT32_MAX;
+}
+
+// ----------------------------------------------------------------------------
+// DESPACHO DE EVENTOS ENTRE TAREAS (llamables desde callbacks de nimble_host)
+// ----------------------------------------------------------------------------
+static inline void postBridgeEvent(uint32_t bits) {
+  TaskHandle_t h = bridgeTaskHandle;
+  if (h != nullptr) xTaskNotify(h, bits, eSetBits);
+}
+
+static inline void postScaleEvent(uint32_t bits) {
+  TaskHandle_t h = scaleTaskHandle;
+  if (h != nullptr) xTaskNotify(h, bits, eSetBits);
+}
 
 // Botón BOOT y LED RGB con caché de estado
 unsigned long bootBtnPressStartMs        = 0;
@@ -315,6 +443,13 @@ void updateStatusLed() {
     return;
   }
 
+  if (now < resetBlinkUntilMs) {
+    // Magenta parpadeante (120 ms): confirmación de borrado NVS, sin bloquear tareas
+    if (((now / 120) % 2) == 0) writeRgbPixelSafe(255, 0, 180);
+    else                        writeRgbPixelSafe(0, 0, 0);
+    return;
+  }
+
   if (bootBtnPressed && !bootBtnLongPressHandled && (now - bootBtnPressStartMs > 400)) {
     writeRgbPixelSafe(255, 0, 128); // Rosa/Magenta: presionando botón BOOT
     return;
@@ -338,12 +473,8 @@ void updateStatusLed() {
 }
 
 void blinkResetConfirmation() {
-  for (int i = 0; i < 6; i++) {
-    writeRgbPixelSafe(255, 0, 180);
-    delay(120);
-    writeRgbPixelSafe(0, 0, 0);
-    delay(120);
-  }
+  // No bloqueante: updateStatusLed() (loop) dibuja 6 parpadeos durante 1.44 s
+  resetBlinkUntilMs = millis() + 6 * 240;
 }
 
 // ============================================================================
@@ -379,10 +510,33 @@ void appendAcaiaChecksum(uint8_t* packet, size_t payloadOffset, size_t payloadLe
 }
 
 // ============================================================================
-// CONSTRUCCIÓN Y ENVÍO DE TRAMAS ACAIA LUNAR (EJECUTADAS DESDE EL LOOP)
+// CONSTRUCCIÓN Y ENVÍO DE TRAMAS ACAIA LUNAR (EJECUTADAS SOLO DESDE bridge_tx)
 // ============================================================================
-void sendAcaiaRawPacket(const uint8_t* data, size_t len) {
-  if (!appConnected) return;
+/**
+ * Envía la notificación únicamente a la conexión de la App (appConnHandle).
+ * En NimBLE v2 notify() sin handle recorre getPeerDevices(), que construye un
+ * std::vector (reserva en heap) en CADA paquete; con el handle directo se evita.
+ * Devuelve false si el stack rechazó el paquete (sin buffers).
+ */
+static bool notifyToApp(NimBLECharacteristic* chr, const uint8_t* data, size_t len) {
+  chr->setValue(data, len);
+#if defined(NIMBLE_V2)
+  uint16_t h = appConnHandle;
+  bool ok = (h != 0xFFFF) ? chr->notify(h) : chr->notify();
+#else
+  chr->notify();
+  bool ok = true;
+#endif
+  if (ok) {
+    acaiaPacketsTxCount = acaiaPacketsTxCount + 1;
+  } else {
+    notifyFailTotal = notifyFailTotal + 1;
+  }
+  return ok;
+}
+
+bool sendAcaiaRawPacket(const uint8_t* data, size_t len) {
+  if (!appConnected) return false;
 
   // NOTA CRÍTICA NIMBLE v2.x:
   // En NimBLE v2.x, characteristic->notify() envía un paquete ATT HANDLE_VALUE_NTF
@@ -394,15 +548,12 @@ void sendAcaiaRawPacket(const uint8_t* data, size_t len) {
     targetChar = (pAcaiaIsscNotifyChar1E4D != nullptr) ? pAcaiaIsscNotifyChar1E4D : pAcaiaNotifyCharFF11;
   }
 
-  if (targetChar != nullptr) {
-    targetChar->setValue(data, len);
-    targetChar->notify();
-    acaiaPacketsTxCount = acaiaPacketsTxCount + 1;
-  }
+  if (targetChar == nullptr) return false;
+  return notifyToApp(targetChar, data, len);
 }
 
-void sendAcaiaMessage(uint8_t msgType, const uint8_t* payload, size_t payloadLen) {
-  if (payloadLen > 48) return;
+bool sendAcaiaMessage(uint8_t msgType, const uint8_t* payload, size_t payloadLen) {
+  if (payloadLen > 48) return false;
   uint8_t packet[64];
   packet[0] = ACAIA_HEADER_1;
   packet[1] = ACAIA_HEADER_2;
@@ -411,7 +562,7 @@ void sendAcaiaMessage(uint8_t msgType, const uint8_t* payload, size_t payloadLen
     memcpy(&packet[3], payload, payloadLen);
   }
   appendAcaiaChecksum(packet, 3, payloadLen);
-  sendAcaiaRawPacket(packet, 3 + payloadLen + 2);
+  return sendAcaiaRawPacket(packet, 3 + payloadLen + 2);
 }
 
 void sendAcaiaHeartbeatAck() {
@@ -456,8 +607,38 @@ void sendAcaiaAckEvent() {
   sendAcaiaMessage(ACAIA_MSG_EVENT, payload, sizeof(payload));
 }
 
-void sendBookooWeightNotification(float weightGrams) {
-  if (!appConnected || pBookooNotifyCharFF11 == nullptr) return;
+/**
+ * Cálculo de caudal (g/s) con EMA para Wendougee (Registro 1423) y de1app.
+ * Se ejecuta UNA vez por muestra nueva de la balanza usando el timestamp de
+ * llegada de esa muestra (no el instante de envío), así el dt es exacto y el
+ * caudal no se retrasa ni oscila por el jitter del planificador.
+ */
+void updateFlowFromSample(float weightGrams, unsigned long sampleMs) {
+  if (flowResetRequested) {
+    flowResetRequested  = false;
+    currentFlowRateGps  = 0.0f;
+    prevFlowWeightGrams = weightGrams;
+    prevFlowCalcMs      = sampleMs;
+    return;
+  }
+
+  unsigned long dtMs = sampleMs - prevFlowCalcMs;
+  if (prevFlowCalcMs == 0 || dtMs > 1000) {
+    currentFlowRateGps  = 0.0f;
+    prevFlowWeightGrams = weightGrams;
+    prevFlowCalcMs      = sampleMs;
+  } else if (dtMs >= FLOW_MIN_DT_MS) {
+    float rawFlow = ((weightGrams - prevFlowWeightGrams) * 1000.0f) / static_cast<float>(dtMs);
+    if (fabsf(rawFlow) > 50.0f) rawFlow = 0.0f; // Descartar salto por tara
+    currentFlowRateGps = (FLOW_EMA_ALPHA * rawFlow) + ((1.0f - FLOW_EMA_ALPHA) * currentFlowRateGps);
+    if (fabsf(currentFlowRateGps) < 0.05f) currentFlowRateGps = 0.0f;
+    prevFlowWeightGrams = weightGrams;
+    prevFlowCalcMs      = sampleMs;
+  }
+}
+
+bool sendBookooWeightNotification(float weightGrams) {
+  if (!appConnected || pBookooNotifyCharFF11 == nullptr) return false;
 
   unsigned long nowMs = millis();
   unsigned long totalMs = timerAccumulatedMs;
@@ -465,21 +646,8 @@ void sendBookooWeightNotification(float weightGrams) {
     totalMs += (nowMs - timerStartMillis);
   }
 
-  // Cálculo de flujo (g/s) con suavizado EMA para telemetría en Wendougee (Registro 1423) y de1app
-  unsigned long dtMs = nowMs - prevFlowCalcMs;
-  if (prevFlowCalcMs == 0 || dtMs > 1000) {
-    currentFlowRateGps = 0.0f;
-    prevFlowWeightGrams = weightGrams;
-    prevFlowCalcMs = nowMs;
-  } else if (dtMs >= 80) {
-    float rawFlow = ((weightGrams - prevFlowWeightGrams) * 1000.0f) / static_cast<float>(dtMs);
-    if (fabsf(rawFlow) > 50.0f) rawFlow = 0.0f; // Descartar salto por tara
-    currentFlowRateGps = (0.35f * rawFlow) + (0.65f * currentFlowRateGps);
-    if (fabsf(currentFlowRateGps) < 0.05f) currentFlowRateGps = 0.0f;
-    prevFlowWeightGrams = weightGrams;
-    prevFlowCalcMs = nowMs;
-  }
-
+  // El caudal (currentFlowRateGps) se calcula en updateFlowFromSample() por cada
+  // muestra real de la balanza; aquí solo se empaqueta.
   bool isNegative = (weightGrams < -0.005f);
   uint32_t centiGrams = static_cast<uint32_t>(roundf(fabsf(weightGrams) * 100.0f));
   bool isFlowNegative = (currentFlowRateGps < -0.005f);
@@ -515,16 +683,14 @@ void sendBookooWeightNotification(float weightGrams) {
   }
   pkt[19] = xorSum; // Checksum XOR de bytes 0..18
 
-  pBookooNotifyCharFF11->setValue(pkt, sizeof(pkt));
-  pBookooNotifyCharFF11->notify();
-  acaiaPacketsTxCount = acaiaPacketsTxCount + 1;
+  return notifyToApp(pBookooNotifyCharFF11, pkt, sizeof(pkt));
 }
 
-void sendAcaiaWeightNotification(float weightGrams, bool stable) {
-  if (!appConnected) return;
+bool sendAcaiaWeightNotification(float weightGrams, bool stable) {
+  if (!appConnected) return false;
 
 #if defined(EMULATE_BOOKOO)
-  sendBookooWeightNotification(weightGrams);
+  return sendBookooWeightNotification(weightGrams);
 #else
   bool isNegative = (weightGrams < -0.04f);
   float absWeight = fabsf(weightGrams);
@@ -559,7 +725,7 @@ void sendAcaiaWeightNotification(float weightGrams, bool stable) {
   payload[6] = unitCode;
   payload[7] = signAndStability;
 
-  sendAcaiaMessage(ACAIA_MSG_EVENT, payload, sizeof(payload));
+  return sendAcaiaMessage(ACAIA_MSG_EVENT, payload, sizeof(payload));
 #endif
 }
 
@@ -613,12 +779,24 @@ bool sendTimemoreOpenScaleFrame(uint8_t opcode, uint8_t cmd, const uint8_t* payl
   return pScaleWriteChar->writeValue(frame, headerAndPayloadLen + 2, false);
 }
 
-void executeTimemoreTare() {
+/**
+ * Tara por software (bridge_tx, core 0): instantánea, la App ve 0.0 g en el
+ * siguiente paquete. La tara física se delega a scale_link (core 1), que
+ * serializa todas las escrituras GATT hacia la Timemore con connect/keep-alive.
+ */
+void applySoftwareTare() {
+  portENTER_CRITICAL(&sampleMux);
   softwareTareOffset = rawWeightGrams;
   currentWeightGrams = 0.0f;
+  portEXIT_CRITICAL(&sampleMux);
+  flowResetRequested = true;   // Evita un pico negativo de caudal tras la tara
+  currentFlowRateGps = 0.0f;
   triggerTareLedFlash();
-  pendingAcaiaWeightImmediate = true;
+  postScaleEvent(SCL_EVT_TARE);
+}
 
+// Tara física en la Timemore (solo desde scale_link)
+void executeTimemoreTare() {
   if (!scaleConnected || pScaleWriteChar == nullptr) {
     DBG_PRINTLN("[TARA] Tara por software aplicada (0.0g). Balanza fisica no tiene canal Write o no esta conectada.");
     return;
@@ -773,34 +951,42 @@ bool parseTimemorePayload(const uint8_t* data, size_t len, float& outWeightGrams
 }
 
 /**
- * Callback de notificación de la Timemore Dot.
- * IMPORTANTE: No llama a notify() desde aquí para evitar bloqueo re-entrante
- * en la tarea nimble_host. Solo actualiza variables volátiles y activa
- * pendingAcaiaWeightImmediate para que el loop principal lo envíe.
+ * Callback de notificación de la Timemore Dot (tarea nimble_host, core 0).
+ * IMPORTANTE: No llama a notify() desde aquí. Publica la muestra con su marca de
+ * tiempo y despierta a bridge_tx (mismo núcleo, prioridad inmediatamente inferior),
+ * que la reenvía en cuanto este callback retorna.
  */
 void onTimemoreNotifyCallback(NimBLERemoteCharacteristic* pRemoteCharacteristic,
                               uint8_t* pData,
                               size_t length,
                               bool isNotify) {
+  uint32_t arrivalUs = static_cast<uint32_t>(esp_timer_get_time());
   timemorePacketsRxCount = timemorePacketsRxCount + 1;
 
   float parsedWeight = 0.0f;
   bool parsedStable  = true;
   uint8_t batt       = scaleBatteryPct;
 
-  if (parseTimemorePayload(pData, length, parsedWeight, parsedStable, batt)) {
+  bool isWeight = parseTimemorePayload(pData, length, parsedWeight, parsedStable, batt);
+  if (isWeight) {
+    // Batería solo desde tramas de peso (como antes). El byte de la respuesta 0x05
+    // de la Dot NO es un porcentaje (con batería llena reporta 3), así que se ignora.
     scaleBatteryPct = batt;
+    unsigned long arrivalMs = millis();
 
+    portENTER_CRITICAL(&sampleMux);
     if (fabsf(parsedWeight) < 0.15f && fabsf(softwareTareOffset) > 0.15f) {
       softwareTareOffset = 0.0f;
     }
+    rawWeightGrams     = parsedWeight;
+    currentWeightGrams = parsedWeight - softwareTareOffset;
+    weightIsStable     = parsedStable;
+    scaleSampleMs      = arrivalMs;
+    scaleSampleUs      = arrivalUs;
+    scaleSampleSeq     = scaleSampleSeq + 1;
+    portEXIT_CRITICAL(&sampleMux);
 
-    float newNetWeight = parsedWeight - softwareTareOffset;
-
-    rawWeightGrams              = parsedWeight;
-    currentWeightGrams          = newNetWeight;
-    weightIsStable              = parsedStable;
-    pendingAcaiaWeightImmediate = true;
+    postBridgeEvent(EVT_SAMPLE);
     // NOTA CRÍTICA DE RENDIMIENTO: No llamar a Serial.printf dentro de este callback
     // de nimble_host (10-20 Hz) para mantener latencia < 5 us y cero bloqueos USB CDC.
   }
@@ -809,7 +995,7 @@ void onTimemoreNotifyCallback(NimBLERemoteCharacteristic* pRemoteCharacteristic,
 // ============================================================================
 // PROCESADOR DE COMANDOS ENTRANTES DE LA APP MÓVIL (SIN RE-ENTRADA GATT)
 // ============================================================================
-void handleIncomingAcaiaCommand(const uint8_t* data, size_t len) {
+static void parseAcaiaCommand(const uint8_t* data, size_t len, uint32_t& bridgeBits, uint32_t& scaleBits) {
   if (data == nullptr || len == 0) return;
 
   debugPrintHex("[ACAIA-RX CMD]", data, len);
@@ -819,46 +1005,46 @@ void handleIncomingAcaiaCommand(const uint8_t* data, size_t len) {
     uint8_t bkCmd = data[2];
     if (bkCmd == 0x01) { // Tara (03 0A 01 00 00 08)
       DBG_PRINTLN("[BOOKOO-RX] Comando de TARA (0x01) recibido desde la App/Maquina.");
-      pendingScaleTare            = true;
-      pendingAcaiaWeightImmediate = true;
+      bridgeBits |= EVT_TARE;
+      bridgeBits |= EVT_WEIGHT_IMM;
     } else if (bkCmd == 0x04) { // Start Timer
       DBG_PRINTLN("[BOOKOO-RX] Comando START TIMER (0x04) recibido.");
       if (!timerRunning) {
         timerStartMillis = millis();
         timerRunning = true;
       }
-      pendingTimerCmd = 0;
+      pendingTimerCmd = 0; scaleBits |= SCL_EVT_TIMER;
     } else if (bkCmd == 0x05) { // Stop Timer
       DBG_PRINTLN("[BOOKOO-RX] Comando STOP TIMER (0x05) recibido.");
       if (timerRunning) {
         timerAccumulatedMs += (millis() - timerStartMillis);
         timerRunning = false;
       }
-      pendingTimerCmd = 1;
+      pendingTimerCmd = 1; scaleBits |= SCL_EVT_TIMER;
     } else if (bkCmd == 0x06) { // Reset Timer
       DBG_PRINTLN("[BOOKOO-RX] Comando RESET TIMER (0x06) recibido.");
       timerRunning       = false;
       timerAccumulatedMs = 0;
       timerStartMillis   = millis();
-      pendingTimerCmd    = 2;
+      pendingTimerCmd    = 2; scaleBits |= SCL_EVT_TIMER;
     } else if (bkCmd == 0x07) { // Tare + Start Timer
       DBG_PRINTLN("[BOOKOO-RX] Comando TARE + START TIMER (0x07) recibido.");
-      pendingScaleTare   = true;
+      bridgeBits |= EVT_TARE;
       timerAccumulatedMs = 0;
       timerStartMillis   = millis();
       timerRunning       = true;
-      pendingTimerCmd    = 0;
-      pendingAcaiaWeightImmediate = true;
+      pendingTimerCmd    = 0; scaleBits |= SCL_EVT_TIMER;
+      bridgeBits |= EVT_WEIGHT_IMM;
     } else if (bkCmd == 0x08) { // Flow Smoothing Switch (03 0A 08 00/01 00 xor)
       DBG_PRINTLN("[BOOKOO-RX] Comando FLOW SMOOTHING (0x08) recibido.");
-      pendingAcaiaWeightImmediate = true;
+      bridgeBits |= EVT_WEIGHT_IMM;
     }
     return;
   }
 
   // Si es un pulso corto de Handshake/Heartbeat BooKoo (1-2 bytes, ej. {0x02, 0x00} o {0x00})
   if (len < 3) {
-    pendingAcaiaWeightImmediate = true;
+    bridgeBits |= EVT_WEIGHT_IMM;
     return;
   }
 
@@ -874,9 +1060,9 @@ void handleIncomingAcaiaCommand(const uint8_t* data, size_t len) {
     switch (msgType) {
       case ACAIA_MSG_SYSTEM: { // 0x00 - HEARTBEAT
         DBG_PRINTLN("[ACAIA-RX] Heartbeat (0x00) recibido de la App.");
-        pendingAcaiaHeartbeatAck    = true;
-        pendingAcaiaStatusPacket    = true;
-        pendingAcaiaWeightImmediate = true;
+        bridgeBits |= EVT_HB_ACK;
+        bridgeBits |= EVT_STATUS;
+        bridgeBits |= EVT_WEIGHT_IMM;
         idx += 6;
         break;
       }
@@ -885,8 +1071,8 @@ void handleIncomingAcaiaCommand(const uint8_t* data, size_t len) {
         DBG_PRINTLN("[ACAIA-RX] Handshake IDENTIFY (0x0B) recibido de la App.");
         appIdentified               = true;
         appNotificationsEnabled     = true;
-        pendingAcaiaStatusPacket    = true;
-        pendingAcaiaWeightImmediate = true;
+        bridgeBits |= EVT_STATUS;
+        bridgeBits |= EVT_WEIGHT_IMM;
         idx += 20;
         break;
       }
@@ -894,8 +1080,8 @@ void handleIncomingAcaiaCommand(const uint8_t* data, size_t len) {
       case ACAIA_MSG_EVENT: { // 0x0C - NOTIFICATION REQUEST
         DBG_PRINTLN("[ACAIA-RX] Solicitud NOTIFICATION_REQUEST (0x0C) recibida.");
         appNotificationsEnabled     = true;
-        pendingAcaiaStatusPacket    = true;
-        pendingAcaiaWeightImmediate = true;
+        bridgeBits |= EVT_STATUS;
+        bridgeBits |= EVT_WEIGHT_IMM;
         uint8_t evtLen = (idx + 3 < len) ? data[idx + 3] : 0;
         idx += (evtLen > 0) ? (3 + evtLen + 2) : len;
         break;
@@ -903,8 +1089,8 @@ void handleIncomingAcaiaCommand(const uint8_t* data, size_t len) {
 
       case ACAIA_MSG_TARE: { // 0x04 - COMANDO DE TARA
         DBG_PRINTLN("[ACAIA-RX] Comando de TARA (0x04) recibido desde la App.");
-        pendingScaleTare            = true;
-        pendingAcaiaWeightImmediate = true;
+        bridgeBits |= EVT_TARE;
+        bridgeBits |= EVT_WEIGHT_IMM;
         idx += 6;
         break;
       }
@@ -933,21 +1119,30 @@ void handleIncomingAcaiaCommand(const uint8_t* data, size_t len) {
           timerAccumulatedMs = 0;
           timerStartMillis = millis();
         }
-        pendingTimerCmd            = timerAction;
-        pendingAcaiaAckEvent       = true;
-        pendingAcaiaTimerImmediate = true;
+        pendingTimerCmd            = timerAction; scaleBits |= SCL_EVT_TIMER;
+        bridgeBits |= EVT_ACK_EVENT;
+        bridgeBits |= EVT_TIMER_IMM;
         idx += 7;
         break;
       }
 
       default: {
         DBG_PRINTF("[ACAIA-RX] Comando msgType=0x%02X recibido -> respondiendo Status.", msgType);
-        pendingAcaiaStatusPacket = true;
+        bridgeBits |= EVT_STATUS;
         idx = len;
         break;
       }
     }
   }
+}
+
+// Se ejecuta en nimble_host (core 0): solo decodifica y publica eventos.
+void handleIncomingAcaiaCommand(const uint8_t* data, size_t len) {
+  uint32_t bridgeBits = 0;
+  uint32_t scaleBits  = 0;
+  parseAcaiaCommand(data, len, bridgeBits, scaleBits);
+  if (bridgeBits) postBridgeEvent(bridgeBits);
+  if (scaleBits)  postScaleEvent(scaleBits);
 }
 
 // ============================================================================
@@ -956,13 +1151,18 @@ void handleIncomingAcaiaCommand(const uint8_t* data, size_t len) {
 class AcaiaServerCallbacks : public NimBLEServerCallbacks {
 #if defined(NIMBLE_V2)
   void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
+    appConnHandle            = connInfo.getConnHandle();
+    appConnectedAtMs         = millis();
+    appLinkTuned             = false; // scale_link pedirá PHY 2M tras APP_LINK_TUNE_DELAY_MS
     appConnected             = true;
     appNotificationsEnabled  = true;
     pendingStopScan          = true; // Liberar radio BLE para que el discovery/handshake de la App no falle
     appHandshakeGraceUntilMs = millis() + APP_HANDSHAKE_GRACE_MS;
-    // Intervalo balanceado Dual-Role (15ms - 30ms = 12..24 * 1.25ms):
-    // Evita colisiones TDMA de radio con el enlace Central de la Timemore Dot (30-50ms)
-    pServer->updateConnParams(connInfo.getConnHandle(), 12, 24, 0, 400);
+    // Intervalo de baja latencia (APP_CONN_ITVL_MIN..MAX, 15-30 ms) solicitado a la App.
+    // scale_link verifica el intervalo aplicado y lo vuelve a pedir si el central lo ignoró.
+    pServer->updateConnParams(connInfo.getConnHandle(), APP_CONN_ITVL_MIN, APP_CONN_ITVL_MAX, 0, 400);
+    postScaleEvent(SCL_EVT_WAKE);
+    postBridgeEvent(EVT_WEIGHT_IMM);
     DBG_PRINTF("[ACAIA-SRV] App movil conectada! MAC Cliente: %s",
                connInfo.getAddress().toString().c_str());
   }
@@ -971,9 +1171,22 @@ class AcaiaServerCallbacks : public NimBLEServerCallbacks {
     appConnected              = false;
     appIdentified             = false;
     appNotificationsEnabled   = false;
+    appConnHandle             = 0xFFFF;
+    appLinkTuned              = true;
     pActiveAcaiaNotifyChar    = nullptr;
     pendingRestartAdvertising = true;
+    postScaleEvent(SCL_EVT_WAKE);
     DBG_PRINTF("[ACAIA-SRV] App movil desconectada (razon=%d). Reanudando Advertising...", reason);
+  }
+
+  void onConnParamsUpdate(NimBLEConnInfo& connInfo) override {
+    DBG_PRINTF("[ACAIA-SRV] Parametros de enlace App: intervalo=%.2f ms, latencia=%u, timeout=%u ms",
+               connInfo.getConnInterval() * 1.25f, connInfo.getConnLatency(),
+               connInfo.getConnTimeout() * 10);
+  }
+
+  void onPhyUpdate(NimBLEConnInfo& connInfo, uint8_t txPhy, uint8_t rxPhy) override {
+    DBG_PRINTF("[ACAIA-SRV] PHY enlace App: TX=%uM RX=%uM", txPhy, rxPhy);
   }
 #else
   void onConnect(NimBLEServer* pServer) override {
@@ -989,7 +1202,7 @@ class AcaiaServerCallbacks : public NimBLEServerCallbacks {
     appNotificationsEnabled  = true;
     pendingStopScan          = true;
     appHandshakeGraceUntilMs = millis() + APP_HANDSHAKE_GRACE_MS;
-    pServer->updateConnParams(desc->conn_handle, 12, 24, 0, 400);
+    pServer->updateConnParams(desc->conn_handle, APP_CONN_ITVL_MIN, APP_CONN_ITVL_MAX, 0, 400);
     DBG_PRINTF("[ACAIA-SRV] App movil conectada! MAC Cliente: %s",
                NimBLEAddress(desc->peer_ota_addr).toString().c_str());
   }
@@ -1039,7 +1252,7 @@ class AcaiaCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
         pActiveAcaiaNotifyChar = pCharacteristic;
       }
       appNotificationsEnabled     = true;
-      pendingAcaiaWeightImmediate = true;
+      postBridgeEvent(EVT_WEIGHT_IMM);
     }
   }
 #else
@@ -1066,7 +1279,7 @@ class AcaiaCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
         pActiveAcaiaNotifyChar = pCharacteristic;
       }
       appNotificationsEnabled     = true;
-      pendingAcaiaWeightImmediate = true;
+      postBridgeEvent(EVT_WEIGHT_IMM);
     }
   }
 #endif
@@ -1343,6 +1556,10 @@ class TimemoreClientCallbacks : public NimBLEClientCallbacks {
   }
 
 #if defined(NIMBLE_V2)
+  void onPhyUpdate(NimBLEClient* pClient, uint8_t txPhy, uint8_t rxPhy) override {
+    DBG_PRINTF("[TIMEMORE-CLI] PHY enlace Timemore: TX=%uM RX=%uM", txPhy, rxPhy);
+  }
+
   void onConnectFail(NimBLEClient* pClient, int reason) override {
     DBG_PRINTF("[TIMEMORE-CLI] Callback onConnectFail (razon=%d / 0x%03X).", reason, reason);
   }
@@ -1358,7 +1575,9 @@ class TimemoreClientCallbacks : public NimBLEClientCallbacks {
     pScaleWriteChar         = nullptr;
     candidateFound          = false;
     doConnectToScale        = false;
-    lastScanOrConnAttemptMs = 0; // Forzar reconexión/escaneo inmediato en el próximo ciclo de loop()
+    lastScanOrConnAttemptMs = 0; // Forzar reconexión/escaneo inmediato en scale_link
+    scaleLinkTuned          = true;
+    postScaleEvent(SCL_EVT_WAKE);
     DBG_PRINTF("[TIMEMORE-CLI] Balanza Timemore desconectada (razon=%d). Buscando reconexion inmediata...",
                reason);
   }
@@ -1370,6 +1589,8 @@ class TimemoreClientCallbacks : public NimBLEClientCallbacks {
     candidateFound          = false;
     doConnectToScale        = false;
     lastScanOrConnAttemptMs = 0;
+    scaleLinkTuned          = true;
+    postScaleEvent(SCL_EVT_WAKE);
     DBG_PRINTLN("[TIMEMORE-CLI] Balanza Timemore desconectada. Buscando reconexion inmediata...");
   }
 
@@ -1380,6 +1601,8 @@ class TimemoreClientCallbacks : public NimBLEClientCallbacks {
     candidateFound          = false;
     doConnectToScale        = false;
     lastScanOrConnAttemptMs = 0;
+    scaleLinkTuned          = true;
+    postScaleEvent(SCL_EVT_WAKE);
     DBG_PRINTF("[TIMEMORE-CLI] Balanza Timemore desconectada (razon=%d). Buscando reconexion inmediata...",
                reason);
   }
@@ -1478,10 +1701,11 @@ void evaluateScannedDevice(const NimBLEAdvertisedDevice* advertisedDevice) {
   candidateFound    = true;
   doConnectToScale  = true;
 
-  // Detener escaneo inmediatamente desde el loop() para conectar en el acto
+  // Detener escaneo inmediatamente desde scale_link para conectar en el acto
   if (NimBLEDevice::getScan()->isScanning()) {
     pendingStopScan = true;
   }
+  postScaleEvent(SCL_EVT_WAKE);
 }
 
 #if defined(NIMBLE_V2)
@@ -1502,6 +1726,7 @@ class TimemoreScanCallbacks : public NimBLEScanCallbacks {
     if (candidateFound && !scaleConnected) {
       doConnectToScale = true;
     }
+    postScaleEvent(SCL_EVT_WAKE);
   }
 };
 #else
@@ -1517,6 +1742,7 @@ void onScanEndedCallbackV1(NimBLEScanResults results) {
   if (candidateFound && !scaleConnected) {
     doConnectToScale = true;
   }
+  postScaleEvent(SCL_EVT_WAKE);
 }
 #endif
 
@@ -1828,9 +2054,16 @@ bool connectToTimemoreScale(const char* macStr, uint8_t addrType, uint32_t timeo
   pScaleClient->secureConnection(true);
 #endif
 
-  scaleConnected     = true;
+  // El intervalo corto (15-20 ms) y PHY 2M se piden en scale_link tras
+  // SCALE_LINK_TUNE_DELAY_MS, cuando el cifrado SMP ya terminó (evita colisión de
+  // procedimientos LL con el SoC PHY6222).
+  scaleConnectedAtMs = millis();
+  scaleLinkTuned     = false;
+
   softwareTareOffset = 0.0f;
+  flowResetRequested = true;
   lastKeepAliveMs    = millis();
+  scaleConnected     = true;
 
   saveScaleToNVS(macStr, connectedAddrType);
 
@@ -1884,14 +2117,14 @@ void pollBootButtonRuntime() {
       bootBtnPressStartMs     = now;
     } else if (!bootBtnLongPressHandled && (now - bootBtnPressStartMs >= NVS_RESET_HOLD_MS)) {
       bootBtnLongPressHandled = true;
-      clearSavedScaleFromNVS();
+      postScaleEvent(SCL_EVT_NVS_RESET); // Lo ejecuta scale_link (toca escáner/cliente BLE)
     }
   } else {
     if (bootBtnPressed) {
       unsigned long pressDuration = now - bootBtnPressStartMs;
       if (!bootBtnLongPressHandled && pressDuration >= 50 && pressDuration < 1200) {
         DBG_PRINTLN("[BOOT] Pulsacion corta en GPIO 0 -> Ejecutando TARA manual.");
-        pendingScaleTare = true;
+        postBridgeEvent(EVT_TARE);
       }
       bootBtnPressed          = false;
       bootBtnLongPressHandled = false;
@@ -1912,6 +2145,68 @@ void printSerialStatusSummary() {
              (unsigned)ESP.getFreeHeap());
 }
 
+/**
+ * Parámetros reales negociados de ambos enlaces (lo que el otro extremo aceptó).
+ * Se ejecuta en loop (core 1, prioridad 1): no toca el camino crítico.
+ */
+void printLinkInfo() {
+#if defined(NIMBLE_V2)
+  char dotBuf[64] = "--";
+  char appBuf[72] = "--";
+  if (scaleConnected && pScaleClient != nullptr) {
+    NimBLEConnInfo ci = pScaleClient->getConnInfo();
+    uint8_t tx = 0, rx = 0;
+    pScaleClient->getPhy(&tx, &rx);
+    snprintf(dotBuf, sizeof(dotBuf), "itvl=%.2fms lat=%u phy=%u/%uM",
+             ci.getConnInterval() * 1.25f, ci.getConnLatency(), tx, rx);
+  }
+  uint16_t h = appConnHandle;
+  if (appConnected && h != 0xFFFF && pAcaiaServer != nullptr) {
+    NimBLEConnInfo ci = pAcaiaServer->getPeerInfoByHandle(h);
+    uint8_t tx = 0, rx = 0;
+    pAcaiaServer->getPhy(h, &tx, &rx);
+    snprintf(appBuf, sizeof(appBuf), "itvl=%.2fms lat=%u phy=%u/%uM mtu=%u",
+             ci.getConnInterval() * 1.25f, ci.getConnLatency(), tx, rx, ci.getMTU());
+  }
+  DBG_PRINTF("[LINK] Dot: %s | App: %s", dotBuf, appBuf);
+#endif
+}
+
+/**
+ * Copia y reinicia las estadísticas de latencia (sección crítica de ~100 ns) e
+ * imprime el resumen de la ventana. e2e = llegada de la muestra al ESP32 ->
+ * notificación entregada al stack BLE (no incluye el tiempo en el aire).
+ */
+void printLatencyStats() {
+#if ENABLE_LATENCY_STATS
+  LatencyStats s;
+  portENTER_CRITICAL(&statsMux);
+  s = latStats;
+  resetLatencyStats(latStats);
+  portEXIT_CRITICAL(&statsMux);
+
+  if (s.samples == 0) {
+    DBG_PRINTF("[LAT] Sin muestras de la balanza en esta ventana (txFallos total=%lu).",
+               (unsigned long)notifyFailTotal);
+    return;
+  }
+  uint32_t wakeAvg = static_cast<uint32_t>(s.wakeSumUs / s.samples);
+  uint32_t e2eAvg  = s.e2eCount ? static_cast<uint32_t>(s.e2eSumUs / s.e2eCount) : 0;
+  uint32_t dtAvg   = s.dtCount ? static_cast<uint32_t>(s.dtSumMs / s.dtCount) : 0;
+  DBG_PRINTF("[LAT] n=%lu (%.1f Hz) pisadas=%lu | dt balanza ms min/avg/max=%lu/%lu/%lu | "
+             "despertar us=%lu/%lu/%lu | e2e us=%lu/%lu/%lu",
+             (unsigned long)s.samples, s.samples * 1000.0f / SERIAL_STATUS_INTERVAL_MS,
+             (unsigned long)s.coalesced,
+             (unsigned long)(s.dtCount ? s.dtMinMs : 0), (unsigned long)dtAvg, (unsigned long)s.dtMaxMs,
+             (unsigned long)s.wakeMinUs, (unsigned long)wakeAvg, (unsigned long)s.wakeMaxUs,
+             (unsigned long)(s.e2eCount ? s.e2eMinUs : 0), (unsigned long)e2eAvg, (unsigned long)s.e2eMaxUs);
+  DBG_PRINTF("[LAT] e2e hist <0.25ms:%lu <1ms:%lu <5ms:%lu <15ms:%lu >=15ms:%lu | txPeso=%lu txFallos=%lu",
+             (unsigned long)s.hist[0], (unsigned long)s.hist[1], (unsigned long)s.hist[2],
+             (unsigned long)s.hist[3], (unsigned long)s.hist[4],
+             (unsigned long)s.txWeight, (unsigned long)s.txFail);
+#endif
+}
+
 void pollSerialDebugCommands() {
 #if ENABLE_SERIAL_DEBUG
   while (Serial.available() > 0) {
@@ -1920,18 +2215,21 @@ void pollSerialDebugCommands() {
       printSerialStatusSummary();
     } else if (c == 't' || c == 'T') {
       DBG_PRINTLN("[SERIAL-CMD] Comando 't' recibido -> Ejecutando TARA.");
-      pendingScaleTare = true;
+      postBridgeEvent(EVT_TARE);
     } else if (c == 'r' || c == 'R') {
       DBG_PRINTLN("[SERIAL-CMD] Comando 'r' recibido -> Borrando MAC guardada en NVS.");
-      clearSavedScaleFromNVS();
+      postScaleEvent(SCL_EVT_NVS_RESET);
     } else if (c == 's' || c == 'S') {
       DBG_PRINTLN("[SERIAL-CMD] Comando 's' recibido -> Forzando escaneo BLE.");
-      scanPausedByUser = false;
-      startTimemoreScan();
+      postScaleEvent(SCL_EVT_SCAN);
+    } else if (c == 'l' || c == 'L') {
+      printLinkInfo();
+      printLatencyStats();
     } else if (c == 'p' || c == 'P') {
       scanPausedByUser = !scanPausedByUser;
       if (scanPausedByUser) {
         pendingStopScan = true;
+        postScaleEvent(SCL_EVT_WAKE);
         DBG_PRINTLN("[SERIAL-CMD] Escaneo de Timemore PAUSADO (100% radio dedicado a la App Acaia).");
       } else {
         DBG_PRINTLN("[SERIAL-CMD] Escaneo de Timemore REANUDADO.");
@@ -1944,6 +2242,9 @@ void pollSerialDebugCommands() {
 // ============================================================================
 // SETUP PRINCIPAL CON VENTANA USB CDC Y TRAZAS PASO A PASO
 // ============================================================================
+void bridgeTaskFn(void* arg);
+void scaleLinkTaskFn(void* arg);
+
 void setup() {
   Serial.begin(115200);
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
@@ -2002,6 +2303,12 @@ void setup() {
   DBG_PRINTF("[BOOT 4/6] Inicializando stack NimBLE como '%s'...", acaiaDeviceName);
   NimBLEDevice::init(acaiaDeviceName);
 
+  // bridge_tx debe existir ANTES de publicar el servidor: la App puede conectar y
+  // escribir el handshake en cuanto arranca el Advertising.
+  resetLatencyStats(latStats);
+  xTaskCreatePinnedToCore(bridgeTaskFn, "bridge_tx", BRIDGE_TASK_STACK, nullptr,
+                          BRIDGE_TASK_PRIO, &bridgeTaskHandle, BRIDGE_TASK_CORE);
+
   // Habilitar soporte de Bonding BLE Legacy Just-Works (compatible con SoC Phyplus PHY6222
   // y su GAPBondMgr / GAPBOND_AUTO_SYNC_WL) para que la Timemore Dot guarde al ESP32-S3
   // en su White List cuando se empareje y reconecte automáticamente al encender
@@ -2047,12 +2354,191 @@ void setup() {
   pScan->setWindow(24);   // 24 * 0.625ms = 15.0 ms
 
   DBG_PRINTLN("--------------------------------------------------------------");
-  DBG_PRINTLN("Comandos en Monitor Serie: [?] Estado [t] Tara [r] Reset NVS [s] Escanear [p] Pausar Scan");
+  DBG_PRINTLN("Comandos en Monitor Serie: [?] Estado [l] Enlaces+Latencia [t] Tara [r] Reset NVS [s] Escanear [p] Pausar Scan");
   DBG_PRINTLN("--------------------------------------------------------------");
   Serial.flush();
 
-  // Si ya tenemos una MAC guardada en NVS, intentar primero conexión directa rápida
-  // (atrapa a la balanza al instante si ya está encendida) y si no, iniciar escaneo
+  // scale_link (core 1) hace la reconexión directa a la MAC guardada / el escaneo.
+  // Antes se hacía aquí y bloqueaba el arranque hasta 3.8 s.
+  xTaskCreatePinnedToCore(scaleLinkTaskFn, "scale_link", SCALE_TASK_STACK, nullptr,
+                          SCALE_TASK_PRIO, &scaleTaskHandle, SCALE_TASK_CORE);
+  DBG_PRINTF("[BOOT] Tareas: bridge_tx (core %d, prio %d) | scale_link (core %d, prio %d) | loop (core %d)",
+             BRIDGE_TASK_CORE, (int)BRIDGE_TASK_PRIO, SCALE_TASK_CORE, SCALE_TASK_PRIO, xPortGetCoreID());
+}
+
+// ============================================================================
+// TAREA bridge_tx (CORE 0): ÚNICO EMISOR HACIA LA APP / MÁQUINA
+// ============================================================================
+/**
+ * Dirigida por eventos: duerme en xTaskNotifyWait() hasta que llega una muestra,
+ * un comando de la App o vence un plazo (relleno de 100 ms, timer, ritmo mínimo).
+ *
+ * Reglas de transmisión (máximo 1 paquete por ranura de HANDSHAKE_PACING_MS):
+ *   1. Peso nuevo (si pasaron >= WEIGHT_MIN_GAP_MS desde el anterior) -> prioridad máxima
+ *   2. Handshake: Heartbeat ACK > INFO > STATUS > ACK evento > Timer inmediato
+ *   3. Relleno de peso si no se envió nada en ACAIA_NOTIFY_INTERVAL_MS
+ *   4. Timer Acaia a 10 Hz mientras corre
+ * Todos los plazos se actualizan al INTENTAR enviar (aunque el stack rechace el
+ * paquete), así la tarea nunca entra en un bucle activo.
+ */
+void bridgeTaskFn(void* arg) {
+  static constexpr uint32_t HS_MASK   = EVT_APP_TX_MASK & ~EVT_WEIGHT_IMM;
+  static constexpr uint32_t PACING_US = HANDSHAKE_PACING_MS * 1000UL;
+
+  uint32_t pending             = 0;
+  unsigned long lastWeightTxMs = 0;
+  unsigned long lastTimerTxMs  = 0;
+  uint32_t lastAnyTxUs         = 0;
+  unsigned long prevSampleMs   = 0;
+  uint32_t lastArrivalUs       = 0;
+  bool latencyPending          = false; // Hay una muestra cuyo e2e aún no se midió
+
+  for (;;) {
+    // ---- 1. Calcular el próximo plazo y dormir hasta entonces (o hasta un evento) ----
+    TickType_t waitTicks = pdMS_TO_TICKS(ACAIA_NOTIFY_INTERVAL_MS);
+    if (appConnected) {
+      unsigned long now = millis();
+      uint32_t sinceW = now - lastWeightTxMs;
+      uint32_t waitMs = (sinceW >= ACAIA_NOTIFY_INTERVAL_MS) ? 0 : (ACAIA_NOTIFY_INTERVAL_MS - sinceW);
+      if (timerRunning) {
+        uint32_t sinceT = now - lastTimerTxMs;
+        uint32_t tIn = (sinceT >= ACAIA_NOTIFY_INTERVAL_MS) ? 0 : (ACAIA_NOTIFY_INTERVAL_MS - sinceT);
+        if (tIn < waitMs) waitMs = tIn;
+      }
+      if (pending & HS_MASK) waitMs = 0;
+      if (pending & EVT_WEIGHT_IMM) {
+        uint32_t gIn = (sinceW >= WEIGHT_MIN_GAP_MS) ? 0 : (WEIGHT_MIN_GAP_MS - sinceW);
+        if (gIn < waitMs) waitMs = gIn;
+      }
+      uint32_t sinceAnyUs = static_cast<uint32_t>(esp_timer_get_time()) - lastAnyTxUs;
+      if (sinceAnyUs < PACING_US) {
+        uint32_t pIn = (PACING_US - sinceAnyUs + 999) / 1000;
+        if (waitMs < pIn) waitMs = pIn;
+      }
+      waitTicks = pdMS_TO_TICKS(waitMs);
+    }
+
+    uint32_t bits = 0;
+    xTaskNotifyWait(0, UINT32_MAX, &bits, waitTicks);
+    pending |= bits;
+
+    // ---- 2. Muestra nueva: caudal con el timestamp real de llegada ----
+    if (pending & EVT_SAMPLE) {
+      pending &= ~EVT_SAMPLE;
+      uint32_t wakeUs = static_cast<uint32_t>(esp_timer_get_time());
+      portENTER_CRITICAL(&sampleMux);
+      uint32_t seq      = scaleSampleSeq;
+      float w           = currentWeightGrams;
+      unsigned long tMs = scaleSampleMs;
+      uint32_t tUs      = scaleSampleUs;
+      portEXIT_CRITICAL(&sampleMux);
+
+      if (seq != processedSampleSeq) {
+        uint32_t lost = seq - processedSampleSeq - 1;
+        processedSampleSeq = seq;
+        updateFlowFromSample(w, tMs);
+        pending |= EVT_WEIGHT_IMM;
+
+#if ENABLE_LATENCY_STATS
+        uint32_t wake = wakeUs - tUs;
+        uint32_t dt   = (prevSampleMs != 0) ? static_cast<uint32_t>(tMs - prevSampleMs) : 0;
+        portENTER_CRITICAL(&statsMux);
+        latStats.samples++;
+        latStats.coalesced += lost;
+        if (wake < latStats.wakeMinUs) latStats.wakeMinUs = wake;
+        if (wake > latStats.wakeMaxUs) latStats.wakeMaxUs = wake;
+        latStats.wakeSumUs += wake;
+        if (dt > 0 && dt < 2000) {
+          if (dt < latStats.dtMinMs) latStats.dtMinMs = dt;
+          if (dt > latStats.dtMaxMs) latStats.dtMaxMs = dt;
+          latStats.dtSumMs += dt;
+          latStats.dtCount++;
+        }
+        portEXIT_CRITICAL(&statsMux);
+        prevSampleMs   = tMs;
+        lastArrivalUs  = tUs;
+        latencyPending = true;
+#else
+        (void)lost; (void)wakeUs; (void)tUs; (void)prevSampleMs; (void)lastArrivalUs;
+#endif
+      }
+    }
+
+    // ---- 3. Tara: software inmediata aquí, física en scale_link ----
+    if (pending & EVT_TARE) {
+      pending &= ~EVT_TARE;
+      applySoftwareTare();
+      pending |= EVT_WEIGHT_IMM;
+    }
+
+    if (!appConnected) {
+      pending &= ~EVT_APP_TX_MASK;
+      latencyPending = false;
+      continue;
+    }
+
+    // ---- 4. Transmitir como máximo un paquete por ranura de ritmo ----
+    uint32_t nowUs = static_cast<uint32_t>(esp_timer_get_time());
+    if (nowUs - lastAnyTxUs < PACING_US) continue;
+    unsigned long now = millis();
+
+    bool sendWeight = false;
+    if ((pending & EVT_WEIGHT_IMM) && (now - lastWeightTxMs >= WEIGHT_MIN_GAP_MS)) {
+      sendWeight = true;
+    } else if (pending & HS_MASK) {
+      if (pending & EVT_HB_ACK)         { pending &= ~EVT_HB_ACK;    sendAcaiaHeartbeatAck(); }
+      else if (pending & EVT_INFO)      { pending &= ~EVT_INFO;      sendAcaiaInfoPacket(); }
+      else if (pending & EVT_STATUS)    { pending &= ~EVT_STATUS;    sendAcaiaStatusPacket(); }
+      else if (pending & EVT_ACK_EVENT) { pending &= ~EVT_ACK_EVENT; sendAcaiaAckEvent(); }
+      else                              { pending &= ~EVT_TIMER_IMM; sendAcaiaTimerNotification(); lastTimerTxMs = now; }
+      lastAnyTxUs = nowUs;
+      continue;
+    } else if (now - lastWeightTxMs >= ACAIA_NOTIFY_INTERVAL_MS) {
+      sendWeight = true; // Relleno: la balanza no mandó nada nuevo en 100 ms
+    } else if (timerRunning && (now - lastTimerTxMs >= ACAIA_NOTIFY_INTERVAL_MS)) {
+      sendAcaiaTimerNotification();
+      lastTimerTxMs = now;
+      lastAnyTxUs   = nowUs;
+      continue;
+    }
+
+    if (sendWeight) {
+      pending &= ~EVT_WEIGHT_IMM;
+      bool ok = sendAcaiaWeightNotification(currentWeightGrams, weightIsStable);
+      lastWeightTxMs = now;
+      lastAnyTxUs    = nowUs;
+#if ENABLE_LATENCY_STATS
+      uint32_t doneUs = static_cast<uint32_t>(esp_timer_get_time());
+      portENTER_CRITICAL(&statsMux);
+      if (ok) latStats.txWeight++; else latStats.txFail++;
+      if (latencyPending && ok) {
+        uint32_t e2e = doneUs - lastArrivalUs;
+        if (e2e < latStats.e2eMinUs) latStats.e2eMinUs = e2e;
+        if (e2e > latStats.e2eMaxUs) latStats.e2eMaxUs = e2e;
+        latStats.e2eSumUs += e2e;
+        latStats.e2eCount++;
+        uint8_t b = (e2e < 250) ? 0 : (e2e < 1000) ? 1 : (e2e < 5000) ? 2 : (e2e < 15000) ? 3 : 4;
+        latStats.hist[b]++;
+      }
+      portEXIT_CRITICAL(&statsMux);
+      if (ok) latencyPending = false;
+#else
+      (void)ok;
+#endif
+    }
+  }
+}
+
+// ============================================================================
+// TAREA scale_link (CORE 1): ENLACE CON LA TIMEMORE (PUEDE BLOQUEAR)
+// ============================================================================
+/**
+ * Todo lo que puede bloquear vive aquí: connect() síncrono (hasta 4 s + reintento),
+ * descubrimiento GATT, readValue() del keep-alive y las escrituras a la balanza.
+ * Mientras esta tarea espera, bridge_tx sigue atendiendo a la App en el core 0.
+ */
+void scaleLinkTaskFn(void* arg) {
+  // Reconexión directa rápida a la MAC guardada (atrapa a la balanza si ya está encendida)
   if (hasSavedMac) {
     DBG_PRINTF("[BOOT] Intentando reconexion directa rapida a MAC guardada (%s)...", savedTimemoreMac);
     if (!connectToTimemoreScale(savedTimemoreMac, savedTimemoreAddrType, 1800, true)) {
@@ -2061,112 +2547,146 @@ void setup() {
   } else {
     startTimemoreScan();
   }
+
+  for (;;) {
+    uint32_t bits = 0;
+    xTaskNotifyWait(0, UINT32_MAX, &bits, pdMS_TO_TICKS(20));
+    unsigned long now = millis();
+
+    // 1. Peticiones del usuario (botón / Serial)
+    if (bits & SCL_EVT_NVS_RESET) {
+      clearSavedScaleFromNVS();
+    }
+    if (bits & SCL_EVT_SCAN) {
+      scanPausedByUser = false;
+      startTimemoreScan();
+    }
+
+    // 2. Detener escaneo si un callback encontró la balanza o se pausó
+    if (pendingStopScan) {
+      pendingStopScan = false;
+      NimBLEScan* pScan = NimBLEDevice::getScan();
+      if (pScan->isScanning()) {
+        pScan->stop();
+      }
+      isScanning = false;
+    }
+
+    // 3. Reiniciar Advertising si la App se desconectó
+    if (pendingRestartAdvertising) {
+      pendingRestartAdvertising = false;
+      NimBLEDevice::startAdvertising();
+    }
+
+    // 4. Escrituras hacia la Timemore (serializadas con connect/keep-alive)
+    if (bits & SCL_EVT_TARE) {
+      executeTimemoreTare();
+    }
+    if (bits & SCL_EVT_TIMER) {
+      uint8_t cmd = pendingTimerCmd;
+      pendingTimerCmd = 0xFF;
+      if (cmd != 0xFF) executeTimemoreTimerCommand(cmd);
+    }
+
+    // 5. Ajuste diferido del enlace con la Timemore: intervalo corto + PHY 2M
+    if (scaleConnected && !scaleLinkTuned && (now - scaleConnectedAtMs >= SCALE_LINK_TUNE_DELAY_MS)) {
+      scaleLinkTuned = true;
+      bool okItvl = pScaleClient->updateConnParams(SCALE_CONN_ITVL_MIN, SCALE_CONN_ITVL_MAX, 0, 400);
+      bool okPhy  = false;
+#if ENABLE_2M_PHY_SCALE && defined(NIMBLE_V2)
+      okPhy = pScaleClient->updatePhy(BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK, 0);
+#endif
+      DBG_PRINTF("[TIMEMORE-CLI] Ajuste de enlace: intervalo %.2f-%.2f ms (%s) | PHY 2M (%s)",
+                 SCALE_CONN_ITVL_MIN * 1.25f, SCALE_CONN_ITVL_MAX * 1.25f,
+                 okItvl ? "pedido" : "error", okPhy ? "pedido" : "no");
+    }
+
+    // 6. Ajuste diferido del enlace con la App: PHY 2M (tras el descubrimiento GATT)
+    if (appConnected && !appLinkTuned && (now - appConnectedAtMs >= APP_LINK_TUNE_DELAY_MS)) {
+      appLinkTuned = true;
+#if ENABLE_2M_PHY_APP && defined(NIMBLE_V2)
+      uint16_t h = appConnHandle;
+      if (h != 0xFFFF && pAcaiaServer != nullptr) {
+        bool okPhy = pAcaiaServer->updatePhy(h, BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK, 0);
+        DBG_PRINTF("[ACAIA-SRV] Ajuste de enlace App: PHY 2M (%s)", okPhy ? "pedido" : "error");
+      }
+#endif
+    }
+
+    // 6b. Verificar el intervalo que el central realmente aplicó a la App y, si sigue
+    //     por encima de APP_CONN_ITVL_MAX, volver a pedirlo (hasta APP_ITVL_RETRY_MAX veces).
+#if defined(NIMBLE_V2)
+    {
+      static uint8_t appItvlRetries        = 0;
+      static unsigned long appItvlCheckAt  = 0;
+      static unsigned long appSessionStart = 0;
+      if (appConnected && appConnectedAtMs != appSessionStart) {
+        appSessionStart = appConnectedAtMs; // Nueva conexión de App: reiniciar reintentos
+        appItvlRetries  = 0;
+        appItvlCheckAt  = appConnectedAtMs + APP_LINK_TUNE_DELAY_MS;
+      }
+      uint16_t h = appConnHandle;
+      if (appConnected && h != 0xFFFF && pAcaiaServer != nullptr &&
+          appItvlRetries < APP_ITVL_RETRY_MAX && (long)(now - appItvlCheckAt) >= 0) {
+        appItvlCheckAt = now + APP_ITVL_RETRY_PERIOD_MS;
+        uint16_t itvl = pAcaiaServer->getPeerInfoByHandle(h).getConnInterval();
+        if (itvl > APP_CONN_ITVL_MAX) {
+          appItvlRetries++;
+          pAcaiaServer->updateConnParams(h, APP_CONN_ITVL_MIN, APP_CONN_ITVL_MAX, 0, 400);
+          DBG_PRINTF("[ACAIA-SRV] Intervalo App = %.2f ms (> %.2f). Re-solicitando %.2f-%.2f ms (intento %u/%u)",
+                     itvl * 1.25f, APP_CONN_ITVL_MAX * 1.25f, APP_CONN_ITVL_MIN * 1.25f,
+                     APP_CONN_ITVL_MAX * 1.25f, appItvlRetries, APP_ITVL_RETRY_MAX);
+        } else {
+          appItvlRetries = APP_ITVL_RETRY_MAX; // Ya está dentro del objetivo
+          DBG_PRINTF("[ACAIA-SRV] Intervalo App OK = %.2f ms", itvl * 1.25f);
+        }
+      }
+    }
+#endif
+
+    // 7. Conexión y auto-reconexión con la Timemore Dot
+    //    (Respeta la ventana de gracia appHandshakeGraceUntilMs y la pausa manual scanPausedByUser)
+    //    NOTA CRÍTICA PARA WENDOUGEE: Nunca invocar connectToTimemoreScale() a ciegas si
+    //    candidateFound == false, porque apaga el Advertising durante el timeout de conexión
+    //    e impediría que la máquina Wendougee descubra el puente.
+    if (!scaleConnected && !scanPausedByUser && (now >= appHandshakeGraceUntilMs)) {
+      unsigned long waitInterval = appConnected ? RECONNECT_INTERVAL_APP_MS : RECONNECT_INTERVAL_FAST_MS;
+
+      if (doConnectToScale && candidateFound) {
+        doConnectToScale = false;
+        lastScanOrConnAttemptMs = now;
+        connectToTimemoreScale(candidateMac, candidateAddrType, 4000, false);
+      } else if (!isScanning && (now - lastScanOrConnAttemptMs >= waitInterval)) {
+        lastScanOrConnAttemptMs = now;
+        startTimemoreScan();
+      }
+    } else if (scaleConnected) {
+      // 8. Keep-Alive cada 25 s para evitar que la Timemore Dot se apague sola
+      if (now - lastKeepAliveMs >= TIMEMORE_KEEPALIVE_INTERVAL_MS) {
+        lastKeepAliveMs = now;
+        sendTimemoreKeepAlive();
+      }
+    }
+  }
 }
 
 // ============================================================================
-// LOOP PRINCIPAL NO BLOQUEANTE
+// LOOP (CORE 1, PRIORIDAD 1): INTERFAZ DE USUARIO Y DIAGNÓSTICO
 // ============================================================================
+// Nada sensible a la latencia vive aquí: el reenvío de peso es de bridge_tx y la
+// gestión del enlace con la balanza es de scale_link.
 void loop() {
-  unsigned long now = millis();
-
-  // 1. Monitorear botón BOOT (GPIO 0), comandos por Serial y LED RGB
   pollBootButtonRuntime();
   pollSerialDebugCommands();
   updateStatusLed();
 
-  // 2. Detener escaneo de forma segura si un callback encontró la balanza
-  if (pendingStopScan) {
-    pendingStopScan = false;
-    NimBLEScan* pScan = NimBLEDevice::getScan();
-    if (pScan->isScanning()) {
-      pScan->stop();
-    }
-    isScanning = false;
-  }
-
-  // 3. Reiniciar Advertising del servidor Acaia si la App móvil se desconectó
-  if (pendingRestartAdvertising) {
-    pendingRestartAdvertising = false;
-    NimBLEDevice::startAdvertising();
-  }
-
-  // 4. Despachar respuestas pendientes del Handshake Acaia fuera de los callbacks BLE
-  //    NOTA ANTI-ATASCOS: Se envía máximo 1 paquete GATT por ciclo de loop (usando else-if)
-  //    para nunca saturar la cola HCI ACL de NimBLE ni el parser Tcl de de1app.
-  if (appConnected) {
-    if (pendingAcaiaHeartbeatAck) {
-      pendingAcaiaHeartbeatAck = false;
-      sendAcaiaHeartbeatAck();
-    } else if (pendingAcaiaInfoPacket) {
-      pendingAcaiaInfoPacket = false;
-      sendAcaiaInfoPacket();
-    } else if (pendingAcaiaStatusPacket) {
-      pendingAcaiaStatusPacket = false;
-      sendAcaiaStatusPacket();
-    } else if (pendingAcaiaAckEvent) {
-      pendingAcaiaAckEvent = false;
-      sendAcaiaAckEvent();
-    } else if (pendingAcaiaTimerImmediate) {
-      pendingAcaiaTimerImmediate = false;
-      sendAcaiaTimerNotification();
-    } else if (pendingAcaiaWeightImmediate && (now - lastAcaiaNotifyMs >= 45)) {
-      pendingAcaiaWeightImmediate = false;
-      sendAcaiaWeightNotification(currentWeightGrams, weightIsStable);
-      lastAcaiaNotifyMs = now;
-    }
-  }
-
-  // 5. Ejecutar comandos diferidos hacia la Timemore Dot (Tara / Timer)
-  if (pendingScaleTare) {
-    pendingScaleTare = false;
-    executeTimemoreTare();
-  }
-
-  if (pendingTimerCmd != 0xFF) {
-    uint8_t cmd = pendingTimerCmd;
-    pendingTimerCmd = 0xFF;
-    executeTimemoreTimerCommand(cmd);
-  }
-
-  // 6. Gestión de conexión y auto-reconexión con la balanza Timemore Dot
-  //    (Respeta la ventana de gracia appHandshakeGraceUntilMs y pausa manual scanPausedByUser)
-  //    NOTA CRÍTICA PARA WENDOUGEE: Nunca invocar connectToTimemoreScale() a ciegas en el
-  //    loop si candidateFound == false, porque connectToTimemoreScale() apaga el Advertising
-  //    durante el timeout de conexión e impediría que la máquina Wendougee descubra el puente.
-  if (!scaleConnected && !scanPausedByUser && (now >= appHandshakeGraceUntilMs)) {
-    unsigned long waitInterval = appConnected ? RECONNECT_INTERVAL_APP_MS : RECONNECT_INTERVAL_FAST_MS;
-
-    if (doConnectToScale && candidateFound) {
-      doConnectToScale = false;
-      lastScanOrConnAttemptMs = now;
-      connectToTimemoreScale(candidateMac, candidateAddrType, 4000, false);
-    } else if (!isScanning && (now - lastScanOrConnAttemptMs >= waitInterval)) {
-      lastScanOrConnAttemptMs = now;
-      startTimemoreScan();
-    }
-  } else if (scaleConnected) {
-    // 7. Pulso Keep-Alive cada 25s para evitar que la Timemore Dot se apague sola
-    if (now - lastKeepAliveMs >= TIMEMORE_KEEPALIVE_INTERVAL_MS) {
-      lastKeepAliveMs = now;
-      sendTimemoreKeepAlive();
-    }
-  }
-
-  // 8. Transmisión periódica de peso a ~10 Hz (100 ms) hacia la App Acaia
-  if (appConnected && (now - lastAcaiaNotifyMs >= ACAIA_NOTIFY_INTERVAL_MS)) {
-    lastAcaiaNotifyMs           = now;
-    pendingAcaiaWeightImmediate = false;
-    sendAcaiaWeightNotification(currentWeightGrams, weightIsStable);
-    if (timerRunning) {
-      sendAcaiaTimerNotification();
-    }
-  }
-
-  // 9. Reporte periódico de estado por Puerto Serial cada 5 segundos
+  unsigned long now = millis();
   if (now - lastSerialStatusMs >= SERIAL_STATUS_INTERVAL_MS) {
     lastSerialStatusMs = now;
     printSerialStatusSummary();
+    printLinkInfo();
+    printLatencyStats();
   }
 
-  delay(3);
+  vTaskDelay(pdMS_TO_TICKS(10));
 }
